@@ -104,13 +104,12 @@ static const Text* latestLogicallyAdjacentTextNode(const Text* text)
 
 String Text::wholeText() const
 {
-    const Text* startText = earliestLogicallyAdjacentTextNode(this);
-    const Text* endText = latestLogicallyAdjacentTextNode(this);
-    ASSERT(endText);
-    const Node* onePastEndText = TextNodeTraversal::nextSibling(*endText);
+    RefPtr startText = const_cast<Text*>(earliestLogicallyAdjacentTextNode(this));
+    RefPtr endText = const_cast<Text*>(latestLogicallyAdjacentTextNode(this));
+    RefPtr onePastEndText = const_cast<Text*>(TextNodeTraversal::nextSibling(*endText));
 
     StringBuilder result;
-    for (const Text* text = startText; text != onePastEndText; text = TextNodeTraversal::nextSibling(*text))
+    for (RefPtr text = startText; text != onePastEndText; text = const_cast<Text*>(TextNodeTraversal::nextSibling(*text)))
         result.append(text->data());
     return result.toString();
 }
