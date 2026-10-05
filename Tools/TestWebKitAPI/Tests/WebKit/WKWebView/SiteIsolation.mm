@@ -186,57 +186,6 @@
 }
 @end
 
-@interface NavigationDelegateWithUnresponsiveCallback : NSObject<WKNavigationDelegate>
-@property (nonatomic, readonly) BOOL didBecomeUnresponsive;
-@property (nonatomic, readonly) BOOL didBecomeResponsive;
-@property (nonatomic, copy) void (^decidePolicyForNavigationActionWithPreferences)(WKNavigationAction *, WKWebpagePreferences *, void (^)(WKNavigationActionPolicy, WKWebpagePreferences *));
-- (void)waitForDidFinishNavigation;
-@end
-
-@implementation NavigationDelegateWithUnresponsiveCallback {
-    bool _finishedNavigation;
-    bool _didBecomeUnresponsive;
-    bool _didBecomeResponsive;
-}
-- (void)webView:(WKWebView *)webView didReceiveAuthenticationChallenge:(NSURLAuthenticationChallenge *)challenge completionHandler:(void (^)(NSURLSessionAuthChallengeDisposition, NSURLCredential *))completionHandler
-{
-    EXPECT_WK_STREQ(challenge.protectionSpace.authenticationMethod, NSURLAuthenticationMethodServerTrust);
-    completionHandler(NSURLSessionAuthChallengeUseCredential, [NSURLCredential credentialForTrust:challenge.protectionSpace.serverTrust]);
-}
-- (void)waitForDidFinishNavigation
-{
-    _finishedNavigation = false;
-    TestWebKitAPI::Util::run(&_finishedNavigation);
-}
-- (BOOL)didBecomeUnresponsive
-{
-    return _didBecomeUnresponsive;
-}
-- (BOOL)didBecomeResponsive
-{
-    return _didBecomeResponsive;
-}
-- (void)_webViewWebProcessDidBecomeUnresponsive:(WKWebView *)webView
-{
-    _didBecomeUnresponsive = true;
-}
-- (void)_webViewWebProcessDidBecomeResponsive:(WKWebView *)webView
-{
-    _didBecomeResponsive = true;
-}
-- (void)webView:(WKWebView *)webView decidePolicyForNavigationAction:(WKNavigationAction *)navigationAction preferences:(WKWebpagePreferences *)preferences decisionHandler:(void (^)(WKNavigationActionPolicy, WKWebpagePreferences *))decisionHandler
-{
-    if (_decidePolicyForNavigationActionWithPreferences)
-        _decidePolicyForNavigationActionWithPreferences(navigationAction, preferences, decisionHandler);
-    else
-        decisionHandler(WKNavigationActionPolicyAllow, preferences);
-}
-- (void)webView:(WKWebView *)webView didFinishNavigation:(WKNavigation *)navigation
-{
-    _finishedNavigation = true;
-}
-@end
-
 @interface TestObserver : NSObject
 
 @property (nonatomic, copy) void (^observeValueForKeyPath)(NSString *, id);
@@ -443,11 +392,6 @@ std::pair<std::unique_ptr<InstanceMethodSwizzler>, std::unique_ptr<InstanceMetho
 
 namespace TestWebKitAPI {
 
-static void disableSharedProcess(WKWebViewConfiguration *configuration)
-{
-    setFeatureEnabled(configuration, @"SiteIsolationSharedProcessEnabled", false);
-}
-
 // WKPreferences._usesPageCache is macOS-only, so disable BFCache via the
 // cross-platform _WKProcessPoolConfiguration.pageCacheEnabled property
 // instead (sets the process pool's BFCache capacity to 0).
@@ -463,67 +407,9 @@ static std::pair<RetainPtr<TestWKWebView>, RetainPtr<TestNavigationDelegate>> vi
     return siteIsolatedViewAndDelegate(configuration, rect, false);
 }
 
-enum class EnableProcessCache : bool { No, Yes };
-enum class EnableBackForwardCache : bool { No, Yes };
-static std::pair<RetainPtr<TestWKWebView>, RetainPtr<TestNavigationDelegate>> siteIsolatedViewWithSharedProcess(const HTTPServer& server,
-    EnableProcessCache enableProcessCache = EnableProcessCache::No, NSURL *dataStoreDirectory = nil, NSURL *itpRoot = nil, NSString *domainsWithUserInteraction = nil,
-    EnableBackForwardCache enableBackForwardCache = EnableBackForwardCache::No)
-{
-    RetainPtr<_WKWebsiteDataStoreConfiguration> dataStoreConfiguration;
-    if (!dataStoreDirectory || !itpRoot)
-        dataStoreConfiguration = [[_WKWebsiteDataStoreConfiguration alloc] initNonPersistentConfiguration];
-    else {
-        dataStoreConfiguration = [[_WKWebsiteDataStoreConfiguration alloc] initWithDirectory:dataStoreDirectory];
-        dataStoreConfiguration.get()._resourceLoadStatisticsDirectory = itpRoot;
-    }
-
-    [dataStoreConfiguration setHTTPSProxy:[NSURL URLWithString:[NSString stringWithFormat:@"https://127.0.0.1:%d/", server.port()]]];
-    [dataStoreConfiguration setAdditionalDomainsWithUserInteractionForTesting:domainsWithUserInteraction];
-
-    RetainPtr dataStore = adoptNS([[WKWebsiteDataStore alloc] _initWithConfiguration:dataStoreConfiguration.get()]);
-    [dataStore _setResourceLoadStatisticsEnabled:YES];
-
-    RetainPtr configuration = adoptNS([WKWebViewConfiguration new]);
-    [configuration setWebsiteDataStore:dataStore.get()];
-    if (enableProcessCache == EnableProcessCache::Yes) {
-        RetainPtr processPoolConfiguration = adoptNS([[_WKProcessPoolConfiguration alloc] init]);
-        processPoolConfiguration.get().usesWebProcessCache = YES;
-        processPoolConfiguration.get().prewarmsProcessesAutomatically = YES;
-        // These tests assert WebProcessCache process-reuse semantics; disable BFCache so it
-        // does not compete with WebProcessCache for the cached processes' lifetime, unless a
-        // test explicitly needs both caches enabled together (as Safari has them).
-        if (enableBackForwardCache == EnableBackForwardCache::No)
-            processPoolConfiguration.get().pageCacheEnabled = NO;
-        RetainPtr processPool = adoptNS([[WKProcessPool alloc] _initWithConfiguration:processPoolConfiguration.get()]);
-        [configuration setProcessPool:processPool.get()];
-    }
-
-    RetainPtr navigationDelegate = adoptNS([TestNavigationDelegate new]);
-    [navigationDelegate allowAnyTLSCertificate];
-    enableSiteIsolation(configuration.get());
-    setFeatureEnabled(configuration.get(), @"SiteIsolationSharedProcessEnabled", true);
-    if (enableBackForwardCache == EnableBackForwardCache::Yes)
-        setFeatureEnabled(configuration.get(), @"MultiProcessBackForwardCacheEnabled", true);
-    RetainPtr webView = adoptNS([[TestWKWebView alloc] initWithFrame:CGRectMake(0, 0, 800, 600) configuration:configuration.get()]);
-    webView.get().navigationDelegate = navigationDelegate.get();
-    return { WTF::move(webView), WTF::move(navigationDelegate) };
-}
-
-static std::pair<RetainPtr<TestWKWebView>, RetainPtr<TestNavigationDelegate>> siteIsolatedViewAndDelegateWithoutSharedProcess(const HTTPServer& server, CGRect rect = CGRectZero)
-{
-    RetainPtr configuration = server.httpsProxyConfiguration();
-    disableSharedProcess(configuration.get());
-    return siteIsolatedViewAndDelegate(configuration, rect, true);
-}
-
 static std::pair<RetainPtr<TestWKWebView>, RetainPtr<TestNavigationDelegate>> viewAndDelegate(const HTTPServer& server, CGRect rect = CGRectZero)
 {
     return viewAndDelegate(server.httpsProxyConfiguration(), rect);
-}
-
-static bool processStillRunning(pid_t pid)
-{
-    return !kill(pid, 0);
 }
 
 static bool frameTreesMatch(_WKFrameTreeNode *actualRoot, ExpectedFrameTree&& expectedRoot)
@@ -566,17 +452,6 @@ static bool frameTreesMatch(NSSet<_WKFrameTreeNode *> *actualFrameTrees, Vector<
         expectedFrameTrees.removeAt(index);
     }
     return expectedFrameTrees.isEmpty();
-}
-
-static RetainPtr<NSSet> frameTrees(WKWebView *webView)
-{
-    __block RetainPtr<NSSet> result;
-    [webView _frameTrees:^(NSSet<_WKFrameTreeNode *> *frameTrees) {
-        result = frameTrees;
-    }];
-    while (!result)
-        Util::spinRunLoop();
-    return result;
 }
 
 static void checkTopDocumentURLsInBackForwardCacheAtIndex(WKWebView *webView, NSInteger relativeIndex, NSUInteger expectedProcessCount, NSString *expectedTopDocumentURL)
@@ -661,17 +536,6 @@ static unsigned countWebPages(const RetainPtr<WKWebView>& webView)
     }];
     Util::run(&done);
     return result;
-}
-
-enum class FrameType : bool { Local, Remote };
-static pid_t findFramePID(NSSet<_WKFrameTreeNode *> *set, FrameType local)
-{
-    for (_WKFrameTreeNode *node in set) {
-        if (node.info._isLocalFrame == (local == FrameType::Local))
-            return node.info._processIdentifier;
-    }
-    EXPECT_FALSE(true);
-    return 0;
 }
 
 static void startCountingAnimationFrames(TestWKWebView *webView, WKFrameInfo *frame)
@@ -979,44 +843,6 @@ TEST(SiteIsolation, BasicPostMessageWindowOpen)
     while (!alert)
         Util::spinRunLoop();
     EXPECT_WK_STREQ(alert.get(), "opened page received pong");
-}
-
-struct WebViewAndDelegates {
-    RetainPtr<TestWKWebView> webView;
-    RetainPtr<TestMessageHandler> messageHandler;
-    RetainPtr<TestNavigationDelegate> navigationDelegate;
-    RetainPtr<TestUIDelegate> uiDelegate;
-};
-
-static std::pair<WebViewAndDelegates, WebViewAndDelegates> openerAndOpenedViews(const HTTPServer& server, NSString *url = @"https://example.com/example", bool waitForOpenedNavigation = true)
-{
-    __block WebViewAndDelegates opener;
-    __block WebViewAndDelegates opened;
-    opener.navigationDelegate = adoptNS([TestNavigationDelegate new]);
-    [opener.navigationDelegate allowAnyTLSCertificate];
-    auto configuration = server.httpsProxyConfiguration();
-    enableSiteIsolation(configuration);
-    opener.webView = adoptNS([[TestWKWebView alloc] initWithFrame:NSMakeRect(0, 0, 800, 600) configuration:configuration]);
-    opener.webView.get().navigationDelegate = opener.navigationDelegate.get();
-    opener.uiDelegate = adoptNS([TestUIDelegate new]);
-    opener.uiDelegate.get().createWebViewWithConfiguration = ^(WKWebViewConfiguration *configuration, WKNavigationAction *action, WKWindowFeatures *windowFeatures) {
-        enableSiteIsolation(configuration);
-        opened.webView = adoptNS([[TestWKWebView alloc] initWithFrame:CGRectZero configuration:configuration]);
-        opened.navigationDelegate = adoptNS([TestNavigationDelegate new]);
-        [opened.navigationDelegate allowAnyTLSCertificate];
-        opened.uiDelegate = adoptNS([TestUIDelegate new]);
-        opened.webView.get().navigationDelegate = opened.navigationDelegate.get();
-        opened.webView.get().UIDelegate = opened.uiDelegate.get();
-        return opened.webView.get();
-    };
-    [opener.webView setUIDelegate:opener.uiDelegate.get()];
-    opener.webView.get().configuration.preferences.javaScriptCanOpenWindowsAutomatically = YES;
-    [opener.webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:url]]];
-    while (!opened.webView)
-        Util::spinRunLoop();
-    if (waitForOpenedNavigation)
-        [opened.navigationDelegate waitForDidFinishNavigation];
-    return { WTF::move(opener), WTF::move(opened) };
 }
 
 TEST(SiteIsolation, NavigationAfterWindowOpen)
@@ -10810,7 +10636,6 @@ TEST(SiteIsolation, PartitionWebProcessCache)
     EXPECT_NE(mainFrameProcess, childFrameProcessB);
 }
 
-
 #if PLATFORM(MAC)
 
 TEST(SiteIsolation, SharedProcessAfterClick)
@@ -11001,7 +10826,6 @@ TEST(SiteIsolation, SharedProcessAfterUserInteractionInSharedProcesss)
         },
     });
 }
-
 
 TEST(SiteIsolation, SharedProcessWebProcessCacheSharedProcessForSiteWithUserInteraction)
 {
@@ -12443,21 +12267,6 @@ TEST(SiteIsolation, SelectElementPopupAfterFocusChangesDuringTracking)
     EXPECT_TRUE(Util::waitFor([&] {
         return [[webView objectByEvaluatingJavaScript:@"document.getElementById('sel').value"] isEqualToString:@"c"];
     }));
-}
-
-static void scrollFrameAndWait(TestWKWebView *webView, WKFrameInfo *frame, int scrollX, int scrollY)
-{
-    [webView objectByEvaluatingJavaScript:[NSString stringWithFormat:@"window.scrollTo(%d, %d)", scrollX, scrollY] inFrame:frame];
-    EXPECT_TRUE(Util::waitFor([&] {
-        return [[webView objectByEvaluatingJavaScript:@"window.scrollX" inFrame:frame] intValue] == scrollX
-            && [[webView objectByEvaluatingJavaScript:@"window.scrollY" inFrame:frame] intValue] == scrollY;
-    }));
-    [webView waitForNextPresentationUpdate];
-}
-
-static void scrollFrameAndWait(TestWKWebView *webView, WKFrameInfo *frame, int scrollY)
-{
-    scrollFrameAndWait(webView, frame, 0, scrollY);
 }
 
 // In every test below, the <select> ends up at (150, 150) with size 100x30 in main frame view coordinates.
@@ -17227,34 +17036,6 @@ TEST(SiteIsolation, WebsitePoliciesAppliedToCrossOriginSubframeDocumentLoader)
     EXPECT_WK_STREQ([webView stringByEvaluatingJavaScript:check inFrame:[webView firstChildFrame]], "available");
 }
 
-static std::pair<RetainPtr<TestWKWebView>, RetainPtr<TestNavigationDelegate>> mainFrameOnlyPolicyViewAndDelegate(const HTTPServer& server, void (^applyToMainFramePolicy)(WKWebpagePreferences *), WKWebViewConfiguration *configuration = nil)
-{
-    auto [webView, navigationDelegate] = siteIsolatedViewAndDelegate(configuration ?: server.httpsProxyConfiguration(), CGRectMake(0, 0, 800, 600), true);
-    navigationDelegate.get().decidePolicyForNavigationActionWithPreferences = ^(WKNavigationAction *action, WKWebpagePreferences *preferences, void (^completionHandler)(WKNavigationActionPolicy, WKWebpagePreferences *)) {
-        if (action.targetFrame.mainFrame)
-            applyToMainFramePolicy(preferences);
-        completionHandler(WKNavigationActionPolicyAllow, preferences);
-    };
-    return { WTF::move(webView), WTF::move(navigationDelegate) };
-}
-
-static RetainPtr<WKFrameInfo> loadAndWaitForCrossSiteChildFrame(TestWKWebView *webView, TestNavigationDelegate *navigationDelegate, NSString *mainFrameURL, NSString *childFrameHost)
-{
-    [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:mainFrameURL]]];
-    [navigationDelegate waitForDidFinishNavigation];
-    while (![[webView firstChildFrame].securityOrigin.host isEqualToString:childFrameHost])
-        Util::spinRunLoop();
-    return [webView firstChildFrame];
-}
-
-static HTTPServer::ResponseMap mainAndSubframeResponses()
-{
-    HTTPServer::ResponseMap responses;
-    responses.add("/mainframe"_s, HTTPResponse("<!DOCTYPE html><iframe src='https://b.com/subframe'></iframe>"_s));
-    responses.add("/subframe"_s, HTTPResponse("<!DOCTYPE html>subframe"_s));
-    return responses;
-}
-
 #if !PLATFORM(IOS_FAMILY)
 // The process variant SPI reads process paths and entitlements TestWebKitAPI cannot see on iOS.
 
@@ -17631,7 +17412,6 @@ TEST(SiteIsolation, DisplayRefreshRateReachesSubframeProcess)
     EXPECT_EQ(fastIntervals.size(), 2u);
     for (auto interval : fastIntervals)
         EXPECT_EQ(interval, fastIntervals[0]);
-
 
     [webView _setDisplayForTesting:2 nominalFramesPerSecond:30];
     auto slowIntervals = preferredRenderingUpdateIntervals(webView.get());
@@ -18228,21 +18008,6 @@ TEST(SiteIsolation, MultiProcessBFCacheIframeRendersAfterBackNavigation)
 
     startCountingAnimationFrames(webView.get(), [webView firstChildFrame]);
     expectAnimationFrameCountToIncrease(webView.get(), [webView firstChildFrame]);
-}
-
-static void insertTextInFrame(TestWKWebView *webView, WKFrameInfo *frame, NSString *editableElement, NSString *text)
-{
-    [webView objectByEvaluatingJavaScriptWithUserGesture:[NSString stringWithFormat:@"%@.focus(); document.execCommand('insertText', false, '%@')", editableElement, text] inFrame:frame];
-
-    // Give the platform undo manager a chance to close the group it opened for this edit, so that consecutive edits are undone one at a time.
-    [webView waitForNextPresentationUpdate];
-}
-
-static bool waitForTextContentInFrame(TestWKWebView *webView, WKFrameInfo *frame, NSString *editableElement, NSString *text)
-{
-    return Util::waitFor([&] {
-        return [[webView stringByEvaluatingJavaScript:[NSString stringWithFormat:@"%@.textContent", editableElement] inFrame:frame] isEqualToString:text];
-    });
 }
 
 TEST(SiteIsolation, UndoAndRedoEditInCrossOriginIframeFromMainFrame)
