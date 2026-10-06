@@ -307,7 +307,6 @@ Tests/WebKit/WKWebView/ShouldGoToBackForwardListItem.mm @nonARC
 Tests/WebKit/WKWebView/ShouldOpenExternalURLsInNewWindowActions.mm @nonARC
 Tests/WebKit/WKWebView/ShrinkToFit.mm @nonARC
 Tests/WebKit/WKWebView/ShouldOpenAppLinks.mm @nonARC
-Tests/WebKit/WKWebView/SiteIsolation-1.mm @nonARC
 Tests/WebKit/WKWebView/SiteIsolation.mm @nonARC
 Tests/WebKit/WKWebView/SiteIsolation_ios.mm @nonARC
 Tests/WebKit/WKWebView/SiteIsolation_mac.mm @nonARC

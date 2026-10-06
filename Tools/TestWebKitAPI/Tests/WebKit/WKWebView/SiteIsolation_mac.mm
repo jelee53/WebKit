@@ -44,9 +44,12 @@
 #import "Helpers/cocoa/TestWKWebView.h"
 #import "Helpers/cocoa/WKWebViewConfigurationExtras.h"
 #import "Helpers/mac/AppKitSPI.h"
+#import "Helpers/mac/LocalEventMonitorSwizzler.h"
+#import "Helpers/mac/WKWebViewForTestingImmediateActions.h"
 #import "InstanceMethodSwizzler.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <WebCore/IntRect.h>
+#import <WebCore/LegacyNSPasteboardTypes.h>
 #import <WebCore/SQLiteDatabase.h>
 #import <WebKit/WKFrameInfoPrivate.h>
 #import <WebKit/WKNavigationActionPrivate.h>
@@ -62,8 +65,10 @@
 #import <WebKit/WKWebpagePreferencesPrivate.h>
 #import <WebKit/WKWebsiteDataStorePrivate.h>
 #import <WebKit/_WKFrameTreeNode.h>
+#import <WebKit/_WKHitTestResult.h>
 #import <WebKit/_WKUserInitiatedAction.h>
 #import <WebKit/_WKWebsiteDataStoreConfiguration.h>
+#import <pal/spi/mac/NSImmediateActionGestureRecognizerSPI.h>
 #import <pal/spi/mac/NSSpellCheckerSPI.h>
 #import <wtf/BlockPtr.h>
 #import <wtf/text/MakeString.h>
@@ -86,6 +91,32 @@
 - (void)_webViewDidScroll:(WKWebView *)webView
 {
     ++_pageScrollCount;
+}
+@end
+
+// Stands in for the font panel's attribute converter, and always adds a single underline.
+@interface SiteIsolationUnderlineAttributeConverter : NSObject
+- (NSDictionary *)convertAttributes:(NSDictionary *)attributes;
+@end
+
+@implementation SiteIsolationUnderlineAttributeConverter
+- (NSDictionary *)convertAttributes:(NSDictionary *)attributes
+{
+    RetainPtr convertedAttributes = adoptNS([attributes mutableCopy]);
+    [convertedAttributes setObject:@(NSUnderlineStyleSingle) forKey:NSUnderlineStyleAttributeName];
+    return convertedAttributes.autorelease();
+}
+@end
+
+@interface SiteIsolationMouseMoveOverElementDelegate : NSObject <WKUIDelegatePrivate>
+@property (nonatomic, copy) void (^mouseDidMoveOverElement)(_WKHitTestResult *, NSEventModifierFlags);
+@end
+
+@implementation SiteIsolationMouseMoveOverElementDelegate
+- (void)_webView:(WKWebView *)webView mouseDidMoveOverElement:(_WKHitTestResult *)hitTestResult withFlags:(NSEventModifierFlags)flags userInfo:(id<NSSecureCoding>)userInfo
+{
+    if (_mouseDidMoveOverElement)
+        _mouseDidMoveOverElement(hitTestResult, flags);
 }
 @end
 
@@ -3493,6 +3524,741 @@ TEST(SiteIsolation, CrossSiteIframeProcessesDoNotReportMainFrameScroll)
 
     EXPECT_EQ(pageScrollsForMainFrameScrollTo(100), 1u);
     EXPECT_EQ(pageScrollsForMainFrameScrollTo(300), 1u);
+}
+
+TEST(SiteIsolation, ValidateMenuItemInCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameTextWithCrossOriginIframe } },
+        { "/iframe"_s, { "<body contenteditable>subframe text</body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate, childFrame] = webViewWithFocusedCrossOriginIframe(server);
+    setSelectionInFrame(webView.get(), childFrame.get(), @"getSelection().selectAllChildren(document.body)", _WKSelectionAttributeIsRange);
+
+    // The item starts out disabled and can only become enabled when the web process that validates the
+    // command replies. The main frame has no selection, so its process would report Copy as disabled.
+    RetainPtr menu = adoptNS([NSMenu new]);
+    [menu setAutoenablesItems:NO];
+    RetainPtr item = adoptNS([NSMenuItem new]);
+    [item setTarget:webView.get()];
+    [item setAction:@selector(copy:)];
+    [item setEnabled:NO];
+    [menu addItem:item.get()];
+
+    [webView validateUserInterfaceItem:item.get()];
+    EXPECT_TRUE(Util::waitFor([&] {
+        return [item isEnabled];
+    }));
+}
+
+TEST(SiteIsolation, ChangeFontAttributesInCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameTextWithCrossOriginIframe } },
+        { "/iframe"_s, { "<body contenteditable>subframe text</body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate, childFrame] = webViewWithFocusedCrossOriginIframe(server);
+    setSelectionInFrame(webView.get(), childFrame.get(), @"getSelection().selectAllChildren(document.body)", _WKSelectionAttributeIsRange);
+
+    RetainPtr converter = adoptNS([SiteIsolationUnderlineAttributeConverter new]);
+    [webView changeAttributes:converter.get()];
+    EXPECT_TRUE(Util::waitFor([&] {
+        return [[webView objectByEvaluatingJavaScript:@"document.queryCommandState('underline')" inFrame:childFrame.get()] boolValue];
+    }));
+}
+
+TEST(SiteIsolation, TypingAttributesInCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameTextWithCrossOriginIframe } },
+        { "/iframe"_s, { "<body contenteditable style='font-size: 37px'>subframe text</body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate, childFrame] = webViewWithFocusedCrossOriginIframe(server);
+    setSelectionInFrame(webView.get(), childFrame.get(), @"getSelection().setPosition(document.body.firstChild, 3)", _WKSelectionAttributeIsCaret);
+
+    __block bool done = false;
+    __block RetainPtr<NSDictionary> typingAttributes;
+    [static_cast<id<NSTextInputClient_Async_Staging_44648564>>(webView.get()) typingAttributesWithCompletionHandler:^(NSDictionary<NSString *, id> *attributes) {
+        typingAttributes = attributes;
+        done = true;
+    }];
+    Util::run(&done);
+
+    NSFont *font = [typingAttributes objectForKey:NSFontAttributeName];
+    EXPECT_NOT_NULL(font);
+    EXPECT_EQ(37, font.pointSize);
+}
+
+TEST(SiteIsolation, AttributedSubstringInCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameTextWithCrossOriginIframe } },
+        { "/iframe"_s, { "<body contenteditable>subframe text</body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate, childFrame] = webViewWithFocusedCrossOriginIframe(server);
+    setSelectionInFrame(webView.get(), childFrame.get(), @"getSelection().setPosition(document.body.firstChild, 0)", _WKSelectionAttributeIsCaret);
+
+    __block bool done = false;
+    __block RetainPtr<NSString> substring;
+    [static_cast<id<NSTextInputClient_Async>>(webView.get()) attributedSubstringForProposedRange:NSMakeRange(0, 8) completionHandler:^(NSAttributedString *string, NSRange) {
+        substring = string.string;
+        done = true;
+    }];
+    Util::run(&done);
+
+    EXPECT_WK_STREQ("subframe", substring.get());
+}
+
+TEST(SiteIsolation, SelectionGeometryInCrossOriginIframeUsesMainFrameCoordinates)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { "<body style='margin: 0; height: 2000px'><iframe id='iframe' style='position: absolute; left: 100px; top: 150px; width: 400px; height: 200px; border: none;' src='https://webkit.org/iframe'></iframe></body>"_s } },
+        { "/iframe"_s, { "<body contenteditable style='margin: 0'>subframe text</body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate, childFrame] = webViewWithFocusedCrossOriginIframe(server);
+
+    // The iframe is at (100, 150) in the main frame, so rects left relative to the iframe would be near the origin.
+    setSelectionInFrame(webView.get(), childFrame.get(), @"getSelection().setPosition(document.body.firstChild, 0)", _WKSelectionAttributeIsCaret);
+    NSRect caretRect = NSZeroRect;
+    EXPECT_TRUE(Util::waitFor([&] {
+        caretRect = [webView _caretRectForTesting];
+        return !NSIsEmptyRect(caretRect);
+    }));
+    EXPECT_NEAR(NSMinX(caretRect), 100, 2);
+    EXPECT_NEAR(NSMinY(caretRect), 150, 2);
+
+    auto selectTextAndWaitForSelectionBounds = [&] {
+        [webView objectByEvaluatingJavaScript:@"getSelection().removeAllRanges()" inFrame:childFrame.get()];
+        EXPECT_TRUE(Util::waitFor([&] {
+            return ![webView _selectionRectsForTesting].count;
+        }));
+        [webView objectByEvaluatingJavaScript:@"getSelection().selectAllChildren(document.body)" inFrame:childFrame.get()];
+        NSRect bounds = NSZeroRect;
+        EXPECT_TRUE(Util::waitFor([&] {
+            bounds = NSZeroRect;
+            RetainPtr<NSArray<NSValue *>> rects = [webView _selectionRectsForTesting];
+            for (NSValue *rect in rects.get())
+                bounds = NSUnionRect(bounds, rect.rectValue);
+            return !NSIsEmptyRect(bounds);
+        }));
+        return bounds;
+    };
+
+    auto selectionBounds = selectTextAndWaitForSelectionBounds();
+    EXPECT_NEAR(NSMinX(selectionBounds), 100, 2);
+    EXPECT_NEAR(NSMinY(selectionBounds), 150, 2);
+
+    [webView objectByEvaluatingJavaScript:@"window.scrollTo(0, 100)"];
+    EXPECT_TRUE(Util::waitFor([&] {
+        return [[webView objectByEvaluatingJavaScript:@"window.scrollY"] intValue] == 100;
+    }));
+    [webView waitForNextPresentationUpdate];
+
+    selectionBounds = selectTextAndWaitForSelectionBounds();
+    EXPECT_NEAR(NSMinX(selectionBounds), 100, 2);
+    EXPECT_NEAR(NSMinY(selectionBounds), 50, 2);
+}
+
+TEST(SiteIsolation, ChangeSpellingInCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameTextWithCrossOriginIframe } },
+        { "/iframe"_s, { "<body contenteditable>teh</body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate, childFrame] = webViewWithFocusedCrossOriginIframe(server);
+    setSelectionInFrame(webView.get(), childFrame.get(), @"getSelection().selectAllChildren(document.body)", _WKSelectionAttributeIsRange);
+
+    // changeSpelling: reads the replacement from the sender's selected cell, like the spelling panel's guess list.
+    [webView changeSpelling:[NSTextField labelWithString:@"the"]];
+    EXPECT_TRUE(Util::waitFor([&] {
+        return [[webView stringByEvaluatingJavaScript:@"document.body.textContent" inFrame:childFrame.get()] isEqualToString:@"the"];
+    }));
+}
+
+static NSArray<NSTextCheckingResult *> *swizzledCheckStringReportingMisspelledWord(id, SEL, NSString *stringToCheck, NSRange, NSTextCheckingTypes types, NSDictionary *, NSInteger, NSOrthography **, NSInteger *)
+{
+    if (!(types & NSTextCheckingTypeSpelling))
+        return @[ ];
+
+    NSRange misspelledRange = [stringToCheck rangeOfString:@"teh"];
+    if (misspelledRange.location == NSNotFound)
+        return @[ ];
+
+    return @[ [NSTextCheckingResult spellCheckingResultWithRange:misspelledRange] ];
+}
+
+TEST(SiteIsolation, CheckSpellingInCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameTextWithCrossOriginIframe } },
+        { "/iframe"_s, { "<body contenteditable>hello teh world</body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    InstanceMethodSwizzler checkStringSwizzler {
+        NSSpellChecker.sharedSpellChecker.class,
+        @selector(checkString:range:types:options:inSpellDocumentWithTag:orthography:wordCount:),
+        reinterpret_cast<IMP>(swizzledCheckStringReportingMisspelledWord)
+    };
+
+    auto [webView, navigationDelegate, childFrame] = webViewWithFocusedCrossOriginIframe(server);
+    setSelectionInFrame(webView.get(), childFrame.get(), @"getSelection().setPosition(document.body.firstChild, 0)", _WKSelectionAttributeIsCaret);
+
+    // Check Spelling selects the next misspelled word after the selection.
+    [webView checkSpelling:nil];
+    EXPECT_TRUE(Util::waitFor([&] {
+        return [[webView stringByEvaluatingJavaScript:@"getSelection().toString()" inFrame:childFrame.get()] isEqualToString:@"teh"];
+    }));
+}
+
+TEST(SiteIsolation, CenterSelectionInVisibleAreaInCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameTextWithCrossOriginIframe } },
+        { "/iframe"_s, { "<body contenteditable style='margin: 0'><div style='height: 2000px'></div><span id='target'>target</span></body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate, childFrame] = webViewWithFocusedCrossOriginIframe(server);
+    setSelectionInFrame(webView.get(), childFrame.get(), @"getSelection().setPosition(target.firstChild, 0)", _WKSelectionAttributeIsCaret);
+    EXPECT_EQ(0, [[webView objectByEvaluatingJavaScript:@"window.scrollY" inFrame:childFrame.get()] intValue]);
+
+    // Only the iframe's own scroll position is checked; revealing the selection in ancestor frames that
+    // live in other processes is a separate concern.
+    [webView centerSelectionInVisibleArea:nil];
+    EXPECT_TRUE(Util::waitFor([&] {
+        return [[webView objectByEvaluatingJavaScript:@"window.scrollY" inFrame:childFrame.get()] intValue] > 0;
+    }));
+}
+
+TEST(SiteIsolation, WriteSelectionToPasteboardInCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameTextWithCrossOriginIframe } },
+        { "/iframe"_s, { "<body>subframe text</body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate, childFrame] = webViewWithFocusedCrossOriginIframe(server);
+    setSelectionInFrame(webView.get(), childFrame.get(), @"getSelection().selectAllChildren(document.body)", _WKSelectionAttributeIsRange);
+
+    // Services ask for the selection with a synchronous request per type. Plain text and web archive data
+    // come from different messages, so check both. The main frame has no selection, so its process would
+    // return nothing for either.
+    RetainPtr stringPasteboard = [NSPasteboard pasteboardWithUniqueName];
+    [webView writeSelectionToPasteboard:stringPasteboard.get() types:@[ WebCore::legacyStringPasteboardTypeSingleton() ]];
+    EXPECT_WK_STREQ("subframe text", [stringPasteboard stringForType:WebCore::legacyStringPasteboardTypeSingleton()]);
+
+    RetainPtr dataPasteboard = [NSPasteboard pasteboardWithUniqueName];
+    [webView writeSelectionToPasteboard:dataPasteboard.get() types:@[ UTTypeWebArchive.identifier ]];
+    EXPECT_GT([dataPasteboard dataForType:UTTypeWebArchive.identifier].length, 0U);
+
+    [stringPasteboard releaseGlobally];
+    [dataPasteboard releaseGlobally];
+}
+
+TEST(SiteIsolation, ReadSelectionFromPasteboardInCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameTextWithCrossOriginIframe } },
+        { "/iframe"_s, { "<body contenteditable>original text</body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate, childFrame] = webViewWithFocusedCrossOriginIframe(server);
+    setSelectionInFrame(webView.get(), childFrame.get(), @"getSelection().selectAllChildren(document.body)", _WKSelectionAttributeIsRange);
+
+    RetainPtr pasteboard = [NSPasteboard pasteboardWithUniqueName];
+    [pasteboard clearContents];
+    [pasteboard setString:@"pasted text" forType:NSPasteboardTypeString];
+
+    // This fails if the request goes to the main frame's process, which has no selection. It also fails if
+    // the iframe's process isn't granted access to the pasteboard, in which case it reads nothing.
+    EXPECT_TRUE([webView readSelectionFromPasteboard:pasteboard.get()]);
+    EXPECT_TRUE(Util::waitFor([&] {
+        return [[webView stringByEvaluatingJavaScript:@"document.body.textContent" inFrame:childFrame.get()] isEqualToString:@"pasted text"];
+    }));
+
+    [pasteboard releaseGlobally];
+}
+
+#if ENABLE(ATTACHMENT_ELEMENT)
+
+TEST(SiteIsolation, AttachmentIconInCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { "<body style='margin: 0'><attachment title='main.txt' type='text/plain'></attachment><iframe id='iframe' style='width: 400px; height: 300px; border: none;' src='https://webkit.org/iframe'></iframe></body>"_s } },
+        { "/iframe"_s, { "<body><attachment title='subframe.txt' type='text/plain'></attachment></body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    // Use the internals-enabled plug-in to reach the attachment's user agent shadow tree, and point the data
+    // store at the test HTTPS proxy, since _test_configurationWithTestPlugInClassName: doesn't set one up.
+    RetainPtr configuration = [WKWebViewConfiguration _test_configurationWithTestPlugInClassName:@"WebProcessPlugInWithInternals" configureJSCForTesting:YES];
+    RetainPtr storeConfiguration = adoptNS([[_WKWebsiteDataStoreConfiguration alloc] initNonPersistentConfiguration]);
+    [storeConfiguration setHTTPSProxy:[NSURL URLWithString:[NSString stringWithFormat:@"https://127.0.0.1:%d/", server.port()]]];
+    [configuration setWebsiteDataStore:adoptNS([[WKWebsiteDataStore alloc] _initWithConfiguration:storeConfiguration.get()]).get()];
+    [configuration _setAttachmentElementEnabled:YES];
+
+    // A wide-layout attachment shows its icon in an <img> in its shadow tree, so a delivered icon is observable.
+    // This has to be set on the configuration; WKWebView overwrites the preference from it at initialization.
+    [configuration _setAttachmentWideLayoutEnabled:YES];
+
+    auto [webView, navigationDelegate] = siteIsolatedViewAndDelegate(configuration, CGRectMake(0, 0, 800, 600));
+    [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:@"https://example.com/mainframe"]]];
+    [navigationDelegate waitForDidFinishNavigation];
+    [webView waitForNextPresentationUpdate];
+
+    NSString *iconIsLoadedScript = @"(() => {"
+        "    const icon = internals.shadowRoot(document.querySelector('attachment'))?.getElementById('attachment-icon');"
+        "    return !!icon && icon.src.startsWith('blob:');"
+        "})()";
+
+    // The main frame's attachment checks that icons are delivered at all, so a failure below is specific to the iframe.
+    EXPECT_TRUE(Util::waitFor([&] {
+        return [[webView objectByEvaluatingJavaScript:iconIsLoadedScript] boolValue];
+    }));
+
+    RetainPtr childFrame = [webView firstChildFrame];
+    EXPECT_TRUE(Util::waitFor([&] {
+        return [[webView objectByEvaluatingJavaScript:iconIsLoadedScript inFrame:childFrame.get()] boolValue];
+    }));
+}
+
+#endif // ENABLE(ATTACHMENT_ELEMENT)
+
+TEST(SiteIsolation, DeviceScaleFactorChangeUpdatesCrossOriginIframeCompositingScale)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameTextWithCrossOriginIframe } },
+        { "/iframe"_s, { "<body><div style='will-change: transform; width: 100px; height: 100px; background: green'></div></body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    RetainPtr configuration = [WKWebViewConfiguration _test_configurationWithTestPlugInClassName:@"WebProcessPlugInWithInternals" configureJSCForTesting:YES];
+    RetainPtr storeConfiguration = adoptNS([[_WKWebsiteDataStoreConfiguration alloc] initNonPersistentConfiguration]);
+    [storeConfiguration setHTTPSProxy:[NSURL URLWithString:[NSString stringWithFormat:@"https://127.0.0.1:%d/", server.port()]]];
+    [configuration setWebsiteDataStore:adoptNS([[WKWebsiteDataStore alloc] _initWithConfiguration:storeConfiguration.get()]).get()];
+
+    auto [webView, navigationDelegate] = siteIsolatedViewAndDelegate(configuration, CGRectMake(0, 0, 800, 600));
+    [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:@"https://example.com/mainframe"]]];
+    [navigationDelegate waitForDidFinishNavigation];
+    RetainPtr childFrame = [webView firstChildFrame];
+
+    NSString *layerTreeScript = @"internals.layerTreeAsText(document, internals.LAYER_TREE_INCLUDES_VISIBLE_RECTS)";
+
+    [webView _setOverrideDeviceScaleFactor:3];
+    [webView waitForNextPresentationUpdate];
+    EXPECT_TRUE(Util::waitFor([&] {
+        return [[webView stringByEvaluatingJavaScript:layerTreeScript inFrame:childFrame.get()] containsString:@"(contentsScale 3.00)"];
+    }));
+
+    [webView _setOverrideDeviceScaleFactor:1];
+    [webView waitForNextPresentationUpdate];
+    EXPECT_TRUE(Util::waitFor([&] {
+        return [[webView stringByEvaluatingJavaScript:layerTreeScript inFrame:childFrame.get()] containsString:@"(contentsScale 1.00)"];
+    }));
+}
+
+// Replies to a text checking request must go to the web process that made it. Only that process has the
+// pending request; any other process drops the reply.
+
+static unsigned synchronousTextCheckCount;
+static RetainPtr<NSString> pendingExtendedCheckString;
+static BlockPtr<void(NSInteger, NSArray<NSTextCheckingResult *> *)> pendingExtendedCheckCompletion;
+
+static NSArray<NSTextCheckingResult *> *swizzledCheckStringCountingChecks(id, SEL, NSString *, NSRange, NSTextCheckingTypes, NSDictionary *, NSInteger, NSOrthography **, NSInteger *)
+{
+    ++synchronousTextCheckCount;
+    return @[ ];
+}
+
+static NSInteger swizzledRequestGrammarCheckingDeferringCompletion(id, SEL, NSString *stringToCheck, NSRange, NSString *, NSDictionary *, void (^completionHandler)(NSInteger, NSArray<NSTextCheckingResult *> *))
+{
+    pendingExtendedCheckString = stringToCheck;
+    pendingExtendedCheckCompletion = makeBlockPtr(completionHandler);
+    return 0;
+}
+
+// Types into the editable body of the frame (the main frame if nil), then replies to the extended proofreading
+// request that follows with a grammar result the synchronous check didn't report. The web process that made the
+// request responds by checking the paragraph again, so this returns whether another synchronous check arrives.
+// Setup problems are reported as separate failures, so a bare false means the reply never reached the requester.
+static bool extendedProofreadingReplyTriggersRecheck(TestWKWebView *webView, WKFrameInfo *frame)
+{
+    synchronousTextCheckCount = 0;
+    pendingExtendedCheckString = nil;
+    pendingExtendedCheckCompletion = nullptr;
+
+    [webView objectByEvaluatingJavaScript:@"getSelection().setPosition(document.body)" inFrame:frame];
+    [(id<NSTextInputClient>)webView insertText:@"Let's go in then store\n" replacementRange:NSMakeRange(NSNotFound, 0)];
+    if (!Util::waitFor([] { return !!pendingExtendedCheckCompletion; })) {
+        ADD_FAILURE() << "No extended proofreading request was made";
+        return false;
+    }
+
+    // Let every check caused by the insertion finish, so that any check after the reply is the re-check.
+    [webView waitForNextPresentationUpdate];
+    auto checkCountBeforeReply = synchronousTextCheckCount;
+
+    NSRange phraseRange = [pendingExtendedCheckString rangeOfString:@"go in then"];
+    if (phraseRange.location == NSNotFound) {
+        ADD_FAILURE() << "The extended proofreading request didn't include the typed text: " << [pendingExtendedCheckString UTF8String];
+        return false;
+    }
+    NSDictionary *detail = @{
+        NSGrammarRange: [NSValue valueWithRange:NSMakeRange(0, phraseRange.length)],
+        NSGrammarCorrections: @[ @"go in the" ],
+    };
+    auto completion = std::exchange(pendingExtendedCheckCompletion, nullptr);
+    completion(0, @[ [NSTextCheckingResult grammarCheckingResultWithRange:phraseRange details:@[ detail ]] ]);
+
+    return Util::waitFor([&] {
+        return synchronousTextCheckCount > checkCountBeforeReply;
+    });
+}
+
+TEST(SiteIsolation, ExtendedProofreadingReplyReachesCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/control"_s, { "<body contenteditable></body>"_s } },
+        { "/mainframe"_s, { mainFrameTextWithCrossOriginIframe } },
+        { "/iframe"_s, { "<body contenteditable></body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    InstanceMethodSwizzler checkStringSwizzler {
+        NSSpellChecker.sharedSpellChecker.class,
+        @selector(checkString:range:types:options:inSpellDocumentWithTag:orthography:wordCount:),
+        reinterpret_cast<IMP>(swizzledCheckStringCountingChecks)
+    };
+    InstanceMethodSwizzler requestGrammarCheckingSwizzler {
+        NSSpellChecker.sharedSpellChecker.class,
+        @selector(requestGrammarCheckingOfString:range:language:options:completionHandler:),
+        reinterpret_cast<IMP>(swizzledRequestGrammarCheckingDeferringCompletion)
+    };
+
+    RetainPtr configuration = server.httpsProxyConfiguration();
+    setFeatureEnabled(configuration.get(), @"ExtendedProofreadingEnabled", true);
+
+    // Check the whole mechanism in a main frame first, so that a failure below can only be the routing of the reply.
+    {
+        auto [webView, navigationDelegate] = siteIsolatedViewAndDelegate(configuration, CGRectMake(0, 0, 800, 600));
+        [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:@"https://example.com/control"]]];
+        [navigationDelegate waitForDidFinishNavigation];
+        [webView _setContinuousSpellCheckingEnabledForTesting:YES];
+        [webView _setGrammarCheckingEnabledForTesting:YES];
+        [webView objectByEvaluatingJavaScript:@"document.body.focus()"];
+        EXPECT_TRUE(extendedProofreadingReplyTriggersRecheck(webView.get(), nil));
+    }
+
+    auto [webView, navigationDelegate, childFrame] = webViewWithFocusedCrossOriginIframe(server, configuration.get());
+    [webView _setContinuousSpellCheckingEnabledForTesting:YES];
+    [webView _setGrammarCheckingEnabledForTesting:YES];
+    [webView objectByEvaluatingJavaScriptWithUserGesture:@"document.body.focus()" inFrame:childFrame.get()];
+    EXPECT_TRUE(extendedProofreadingReplyTriggersRecheck(webView.get(), childFrame.get()));
+
+    pendingExtendedCheckCompletion = nullptr;
+    pendingExtendedCheckString = nil;
+}
+
+// Point-based selection. The UI process hands these messages a point in web-view coordinates. The iOS
+// selection gestures hit-test it and re-dispatch into the cross-origin iframe under it, so they work whether
+// or not that iframe is focused; `CharacterIndexForPointAsync` resolves it in the focused frame's process.
+
+TEST(SiteIsolation, CharacterIndexForPointInCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { pointSelectionMainFrame } },
+        { "/iframe"_s, { pointSelectionIframe } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate, childFrame] = webViewWithFocusedCrossOriginIframe(server);
+
+    // characterIndexForPoint: takes a screen point, so undo what WebViewImpl will redo. WKWebView is
+    // flipped on macOS, so its coordinates match the CSS pixels the helper reports.
+    CGPoint pointInView = pointAtCharacterInIframe(webView.get(), childFrame.get(), 6);
+    NSPoint pointInWindow = [webView convertPoint:NSPointFromCGPoint(pointInView) toView:nil];
+    NSPoint point = [webView window] ? [[webView window] convertPointToScreen:pointInWindow] : pointInWindow;
+
+    __block NSUInteger index = NSNotFound;
+    __block bool done = false;
+    [static_cast<id<NSTextInputClient_Async>>(webView.get()) characterIndexForPoint:point completionHandler:^(NSUInteger result) {
+        index = result;
+        done = true;
+    }];
+    Util::run(&done);
+
+    // "w" is at offset 6 in the iframe's "hello world".
+    EXPECT_EQ(6U, index);
+}
+
+#if HAVE(REDESIGNED_TEXT_CURSOR)
+
+TEST(SiteIsolation, DictationCaretStateInCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameTextWithCrossOriginIframe } },
+        { "/iframe"_s, { "<body contenteditable>subframe text</body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    RetainPtr configuration = configurationWithInternals(server);
+    auto [webView, navigationDelegate, childFrame] = webViewWithFocusedCrossOriginIframe(server, configuration.get());
+    setSelectionInFrame(webView.get(), childFrame.get(), @"getSelection().setPosition(document.body.firstChild, 8)", _WKSelectionAttributeIsCaret);
+
+    auto isCaretBlinkingSuspendedInIframe = [&] {
+        return [[webView objectByEvaluatingJavaScript:@"internals.isCaretBlinkingSuspended()" inFrame:childFrame.get()] boolValue];
+    };
+    ASSERT_FALSE(isCaretBlinkingSuspendedInIframe());
+
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"_NSTextInputContextDictationDidPauseNotification" object:nil];
+    EXPECT_TRUE(Util::waitFor(isCaretBlinkingSuspendedInIframe));
+
+    // Changing the caret animator type replaces the animator, and a new animator's blinking isn't suspended.
+    [[NSNotificationCenter defaultCenter] postNotificationName:@"_NSTextInputContextDictationDidStartNotification" object:nil];
+    EXPECT_TRUE(Util::waitFor([&] {
+        return !isCaretBlinkingSuspendedInIframe();
+    }));
+}
+
+#endif // HAVE(REDESIGNED_TEXT_CURSOR)
+
+// The immediate-action (force-click) hit test starts in the main frame's process, which hands it to the process of a
+// cross-origin iframe under the point. That process must answer, whether or not anything in it is focused, and the
+// main frame's process must not act on the hit test it handed off. Once it answers, Look Up must be offered.
+
+static constexpr auto mainFrameWithCrossOriginIframeAtTopLeft = "<body style='margin: 0'><iframe id='iframe' style='position: absolute; left: 0; top: 0; width: 400px; height: 300px; border: none;' src='https://webkit.org/iframe'></iframe></body>"_s;
+
+static std::pair<RetainPtr<WKWebViewForTestingImmediateActions>, RetainPtr<TestNavigationDelegate>> immediateActionWebViewWithCrossOriginIframe(const HTTPServer& server)
+{
+    RetainPtr configuration = server.httpsProxyConfiguration();
+    enableSiteIsolation(configuration.get());
+    RetainPtr webView = adoptNS([[WKWebViewForTestingImmediateActions alloc] initWithFrame:NSMakeRect(0, 0, 500, 500) configuration:configuration.get()]);
+    RetainPtr navigationDelegate = adoptNS([TestNavigationDelegate new]);
+    [navigationDelegate allowAnyTLSCertificate];
+    [webView setNavigationDelegate:navigationDelegate.get()];
+
+    [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:@"https://example.com/mainframe"]]];
+    [navigationDelegate waitForDidFinishNavigation];
+    [webView waitForNextPresentationUpdate];
+    return { WTF::move(webView), WTF::move(navigationDelegate) };
+}
+
+// Focuses the iframe, so that its process answers the immediate-action hit test even without the fix for
+// ImmediateActionInUnfocusedCrossOriginIframe.
+static RetainPtr<WKFrameInfo> focusCrossOriginIframe(TestWKWebView *webView)
+{
+    [webView evaluateJavaScript:@"document.getElementById('iframe').focus()" completionHandler:nil];
+    RetainPtr childFrame = [webView firstChildFrame];
+    while (![childFrame _isFocused]) {
+        Util::spinRunLoop();
+        childFrame = [webView firstChildFrame];
+    }
+    return childFrame;
+}
+
+TEST(SiteIsolation, ImmediateActionInUnfocusedCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameWithCrossOriginIframeAtTopLeft } },
+        { "/iframe"_s, { "<body style='margin: 0'><div style='font-size: 32px;'>Foobar</div></body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate] = immediateActionWebViewWithCrossOriginIframe(server);
+    RetainPtr childFrame = [webView firstChildFrame];
+    EXPECT_FALSE([childFrame _isFocused]);
+
+    auto [hitTestResult, actionType] = [webView simulateImmediateAction:NSMakePoint(16, 16)];
+    EXPECT_WK_STREQ("Foobar", [hitTestResult lookupText]);
+    EXPECT_TRUE([[hitTestResult frameInfo]._handle isEqual:[childFrame _handle]]);
+}
+
+TEST(SiteIsolation, ImmediateActionInCrossOriginIframeDoesNotDispatchForceWillBeginInParent)
+{
+    static constexpr auto countForceWillBegin = "<script>window.forceWillBeginCount = 0; addEventListener('webkitmouseforcewillbegin', () => window.forceWillBeginCount++, true);</script>"_s;
+    HTTPServer server({
+        { "/mainframe"_s, { makeString(countForceWillBegin, mainFrameWithCrossOriginIframeAtTopLeft) } },
+        { "/iframe"_s, { makeString(countForceWillBegin, "<body style='margin: 0'><div style='font-size: 32px;'>Foobar</div></body>"_s) } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate] = immediateActionWebViewWithCrossOriginIframe(server);
+
+    RetainPtr childFrame = focusCrossOriginIframe(webView.get());
+
+    auto [hitTestResult, actionType] = [webView simulateImmediateAction:NSMakePoint(16, 16)];
+    EXPECT_WK_STREQ("Foobar", [hitTestResult lookupText]);
+
+    EXPECT_EQ(1, [[webView objectByEvaluatingJavaScript:@"window.forceWillBeginCount" inFrame:childFrame.get()] intValue]);
+    EXPECT_EQ(0, [[webView objectByEvaluatingJavaScript:@"window.forceWillBeginCount"] intValue]);
+}
+
+TEST(SiteIsolation, ImmediateActionOffersLookUpInCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameWithCrossOriginIframeAtTopLeft } },
+        { "/iframe"_s, { "<body style='margin: 0'><div style='font-size: 32px;'>Foobar</div></body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate] = immediateActionWebViewWithCrossOriginIframe(server);
+    focusCrossOriginIframe(webView.get());
+
+    auto [hitTestResult, actionType] = [webView simulateImmediateAction:NSMakePoint(16, 16)];
+    EXPECT_WK_STREQ("Foobar", [hitTestResult lookupText]);
+    EXPECT_NOT_NULL([webView immediateActionGesture].animationController);
+    EXPECT_EQ(actionType, _WKImmediateActionLookupText);
+}
+
+// Geometry in an immediate-action hit test result must be in the main frame's coordinates, like it is without site
+// isolation, so the UI process can anchor link previews and highlights to it.
+TEST(SiteIsolation, ImmediateActionElementBoundingBoxInCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { "<body style='margin: 0'><iframe id='iframe' style='position: absolute; left: 100px; top: 100px; width: 300px; height: 200px; border: none;' src='https://webkit.org/iframe'></iframe></body>"_s } },
+        { "/iframe"_s, { "<body style='margin: 0'><div id='text' style='font-size: 32px;'>Foobar</div></body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate] = immediateActionWebViewWithCrossOriginIframe(server);
+    RetainPtr childFrame = [webView firstChildFrame];
+
+    auto [hitTestResult, actionType] = [webView simulateImmediateAction:NSMakePoint(116, 116)];
+    EXPECT_WK_STREQ("Foobar", [hitTestResult lookupText]);
+
+    // The hit is on the text node, so the box is the text's.
+    RetainPtr textRect = [webView objectByEvaluatingJavaScript:@"(() => { const range = document.createRange(); range.selectNodeContents(document.getElementById('text').firstChild); const rect = range.getBoundingClientRect(); return [rect.x, rect.y, rect.width, rect.height]; })()" inFrame:childFrame.get()];
+    CGRect boundingBox = [hitTestResult elementBoundingBox];
+    EXPECT_NEAR(CGRectGetMinX(boundingBox), 100 + [[textRect objectAtIndex:0] doubleValue], 1);
+    EXPECT_NEAR(CGRectGetMinY(boundingBox), 100 + [[textRect objectAtIndex:1] doubleValue], 1);
+    EXPECT_NEAR(CGRectGetWidth(boundingBox), [[textRect objectAtIndex:2] doubleValue], 1);
+    EXPECT_NEAR(CGRectGetHeight(boundingBox), [[textRect objectAtIndex:3] doubleValue], 1);
+}
+
+// The animation can begin before the hit test's reply arrives, in which case the UI process waits for it. When the
+// hit is in a cross-origin iframe, the reply that matters comes from the iframe's process, not the main frame's.
+TEST(SiteIsolation, ImmediateActionAnimationBeginsBeforeCrossOriginIframeAnswers)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameWithCrossOriginIframeAtTopLeft } },
+        { "/iframe"_s, { "<body style='margin: 0'><div style='font-size: 32px;'>Foobar</div></body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate] = immediateActionWebViewWithCrossOriginIframe(server);
+
+    auto [hitTestResult, actionType] = [webView simulateImmediateActionBeginningAnimationImmediately:NSMakePoint(16, 16)];
+    EXPECT_WK_STREQ("Foobar", [hitTestResult lookupText]);
+    EXPECT_NOT_NULL([webView immediateActionGesture].animationController);
+    EXPECT_EQ(actionType, _WKImmediateActionLookupText);
+}
+
+// Pressing or releasing a modifier key while the mouse is still re-runs the hover hit test. Over a cross-origin
+// iframe, it must report what's under the mouse in the iframe, not the main frame's <iframe> element.
+TEST(SiteIsolation, ModifierKeyChangeOverLinkInCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameWithCrossOriginIframeAtTopLeft } },
+        { "/iframe"_s, { "<body style='margin: 0'><a href='https://webkit.org/destination' style='display: block; width: 400px; height: 300px;'>link label</a></body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto linkLocation = NSMakePoint(200, 150);
+    LocalEventMonitorSwizzler localMonitorSwizzler;
+    // The flags-changed monitor takes the mouse location from the window, which a test can't move.
+    InstanceMethodSwizzler mouseLocationSwizzler {
+        NSWindow.class,
+        @selector(mouseLocationOutsideOfEventStream),
+        imp_implementationWithBlock(^{
+            return linkLocation;
+        })
+    };
+
+    auto [webView, navigationDelegate] = siteIsolatedViewAndDelegate(server, CGRectMake(0, 0, 400, 300));
+    struct {
+        RetainPtr<_WKHitTestResult> hitTestResult;
+        NSEventModifierFlags flags { 0 };
+    } lastHover;
+    auto* lastHoverPointer = &lastHover;
+    RetainPtr uiDelegate = adoptNS([SiteIsolationMouseMoveOverElementDelegate new]);
+    [uiDelegate setMouseDidMoveOverElement:^(_WKHitTestResult *hitTestResult, NSEventModifierFlags flags) {
+        lastHoverPointer->hitTestResult = hitTestResult;
+        lastHoverPointer->flags = flags;
+    }];
+    [webView setUIDelegate:uiDelegate.get()];
+    [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:@"https://example.com/mainframe"]]];
+    [navigationDelegate waitForDidFinishNavigation];
+    [webView waitForNextPresentationUpdate];
+    [webView _createFlagsChangedEventMonitorForTesting];
+
+    [webView mouseMoveToPoint:linkLocation withFlags:0];
+    EXPECT_TRUE(Util::waitFor([&] {
+        return [[lastHover.hitTestResult absoluteLinkURL].absoluteString isEqualToString:@"https://webkit.org/destination"];
+    }));
+
+    lastHover.hitTestResult = nil;
+    localMonitorSwizzler.sendEventToMonitor([NSEvent mouseEventWithType:NSEventTypeMouseMoved location:linkLocation modifierFlags:NSEventModifierFlagCommand timestamp:0 windowNumber:[[webView hostWindow] windowNumber] context:nil eventNumber:0 clickCount:0 pressure:0]);
+    EXPECT_TRUE(Util::waitFor([&] {
+        return lastHover.hitTestResult && (lastHover.flags & NSEventModifierFlagCommand);
+    }));
+    EXPECT_WK_STREQ("https://webkit.org/destination", [lastHover.hitTestResult absoluteLinkURL].absoluteString);
+}
+
+// Clicking a background window only activates it, unless the click lands on something it can act on right away, like
+// a selection it can start dragging. The focused frame's process answers that, and it has to hand the question on when
+// the click is over a frame in another process.
+
+struct InactiveWebViewWithSelectionInCrossOriginIframe {
+    RetainPtr<TestWKWebView> webView;
+    RetainPtr<TestNavigationDelegate> navigationDelegate;
+    RetainPtr<NSWindow> window;
+    NSPoint selectionCenterInWindow;
+};
+
+static InactiveWebViewWithSelectionInCrossOriginIframe inactiveWebViewWithSelectionInFocusedCrossOriginIframe(const HTTPServer& server)
+{
+    auto [webView, navigationDelegate] = siteIsolatedViewAndDelegate(server, CGRectMake(0, 0, 400, 300));
+    [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:@"https://example.com/mainframe"]]];
+    [navigationDelegate waitForDidFinishNavigation];
+    [webView waitForNextPresentationUpdate];
+
+    RetainPtr childFrame = focusCrossOriginIframe(webView.get());
+    setSelectionInFrame(webView.get(), childFrame.get(), @"getSelection().selectAllChildren(document.getElementById('text'))", _WKSelectionAttributeIsRange);
+
+    // The iframe is at the top left of the view, so its coordinates are the view's. The window's are flipped.
+    RetainPtr center = [webView objectByEvaluatingJavaScript:@"(() => { const rect = getSelection().getRangeAt(0).getBoundingClientRect(); return [rect.x + rect.width / 2, rect.y + rect.height / 2]; })()" inFrame:childFrame.get()];
+    auto selectionCenterInWindow = NSMakePoint([[center objectAtIndex:0] doubleValue], NSHeight([webView frame]) - [[center objectAtIndex:1] doubleValue]);
+
+    // These questions are only asked when the window isn't key, and TestWKWebView's own window always is.
+    RetainPtr window = adoptNS([[NSWindow alloc] initWithContentRect:[webView frame] styleMask:NSWindowStyleMaskBorderless backing:NSBackingStoreBuffered defer:NO]);
+    [[window contentView] addSubview:webView.get()];
+    [webView waitForNextPresentationUpdate];
+    EXPECT_FALSE([window isKeyWindow]);
+
+    return { WTF::move(webView), WTF::move(navigationDelegate), WTF::move(window), selectionCenterInWindow };
+}
+
+static RetainPtr<NSEvent> firstMouseDownEvent(NSWindow *window, NSPoint location)
+{
+    return [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown location:location modifierFlags:0 timestamp:0 windowNumber:window.windowNumber context:nil eventNumber:1 clickCount:1 pressure:1];
+}
+
+static constexpr auto largeTextAtTopLeft = "<body style='margin: 0'><div id='text' style='font-size: 100px;'>Foobar</div></body>"_s;
+
+TEST(SiteIsolation, AcceptsFirstMouseOverSelectionInFocusedCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameWithCrossOriginIframeAtTopLeft } },
+        { "/iframe"_s, { largeTextAtTopLeft } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate, window, selectionCenter] = inactiveWebViewWithSelectionInFocusedCrossOriginIframe(server);
+    EXPECT_TRUE([webView acceptsFirstMouse:firstMouseDownEvent(window.get(), selectionCenter).get()]);
+}
+
+TEST(SiteIsolation, ShouldDelayWindowOrderingOverSelectionInFocusedCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameWithCrossOriginIframeAtTopLeft } },
+        { "/iframe"_s, { largeTextAtTopLeft } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate, window, selectionCenter] = inactiveWebViewWithSelectionInFocusedCrossOriginIframe(server);
+    EXPECT_TRUE([webView shouldDelayWindowOrderingForEvent:firstMouseDownEvent(window.get(), selectionCenter).get()]);
 }
 
 } // namespace TestWebKitAPI

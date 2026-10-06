@@ -27,6 +27,7 @@
 #import "FrameTreeChecks.h"
 #import "Helpers/DeprecatedGlobalValues.h"
 #import "Helpers/PlatformUtilities.h"
+#import "Helpers/Test.h"
 #import "Helpers/Utilities.h"
 #import "Helpers/cocoa/DragAndDropSimulator.h"
 #import "Helpers/cocoa/HTTPServer.h"
@@ -35,6 +36,7 @@
 #import "Helpers/cocoa/TestDownloadDelegate.h"
 #import "Helpers/cocoa/TestNavigationDelegate.h"
 #import "Helpers/cocoa/TestPDFDocument.h"
+#import "Helpers/cocoa/TestResourceLoadDelegate.h"
 #import "Helpers/cocoa/TestScriptMessageHandler.h"
 #import "Helpers/cocoa/TestUIDelegate.h"
 #import "Helpers/cocoa/TestWKWebView.h"
@@ -56,6 +58,7 @@
 #import <WebKit/WKPage.h>
 #import <WebKit/WKPreferencesPrivate.h>
 #import <WebKit/WKProcessPoolPrivate.h>
+#import <WebKit/WKUIDelegatePrivate.h>
 #import <WebKit/WKURLSchemeTaskPrivate.h>
 #import <WebKit/WKUserContentControllerPrivate.h>
 #import <WebKit/WKWebViewConfigurationPrivate.h>
@@ -63,11 +66,15 @@
 #import <WebKit/WKWebViewPrivateForTesting.h>
 #import <WebKit/WKWebpagePreferencesPrivate.h>
 #import <WebKit/WKWebsiteDataStorePrivate.h>
+#import <WebKit/_WKAppHighlight.h>
+#import <WebKit/_WKAppHighlightDelegate.h>
+#import <WebKit/_WKAttachment.h>
 #import <WebKit/_WKContentWorldConfiguration.h>
 #import <WebKit/_WKFeature.h>
 #import <WebKit/_WKFrameTreeNode.h>
 #import <WebKit/_WKJSHandle.h>
 #import <WebKit/_WKProcessPoolConfiguration.h>
+#import <WebKit/_WKResourceLoadInfo.h>
 #import <WebKit/_WKSessionState.h>
 #import <WebKit/_WKTextManipulationConfiguration.h>
 #import <WebKit/_WKTextManipulationDelegate.h>
@@ -77,6 +84,7 @@
 #import <WebKit/_WKWebsiteDataStoreConfiguration.h>
 #import <wtf/BlockPtr.h>
 #import <wtf/HashSet.h>
+#import <wtf/RetainPtr.h>
 #import <wtf/StdLibExtras.h>
 #import <wtf/text/MakeString.h>
 
@@ -97,6 +105,10 @@
 #import "Helpers/cocoa/ImageAnalysisTestingUtilities.h"
 #import <pal/spi/cocoa/VisionKitCoreSPI.h>
 #import <pal/cocoa/VisionKitCoreSoftLink.h>
+#endif
+
+#if ENABLE(MULTI_REPRESENTATION_HEIC)
+#import <UIFoundation/NSAdaptiveImageGlyph.h>
 #endif
 
 @interface WKWebView ()
@@ -358,6 +370,86 @@ std::pair<std::unique_ptr<InstanceMethodSwizzler>, std::unique_ptr<InstanceMetho
 }
 
 @end
+
+@interface SiteIsolationFontAttributesListener : NSObject <WKUIDelegatePrivate>
+- (NSDictionary<NSString *, id> *)lastFontAttributes;
+@end
+
+@implementation SiteIsolationFontAttributesListener {
+    RetainPtr<NSDictionary> _lastFontAttributes;
+}
+
+- (void)_webView:(WKWebView *)webView didChangeFontAttributes:(NSDictionary<NSString *, id> *)fontAttributes
+{
+    _lastFontAttributes = fontAttributes;
+}
+
+- (NSDictionary<NSString *, id> *)lastFontAttributes
+{
+    return _lastFontAttributes.get();
+}
+
+@end
+
+#if ENABLE(ATTACHMENT_ELEMENT)
+@interface SiteIsolationAttachmentObserver : NSObject <WKUIDelegatePrivate>
+- (NSArray<_WKAttachment *> *)insertedAttachments;
+@end
+
+@implementation SiteIsolationAttachmentObserver {
+    RetainPtr<NSMutableArray<_WKAttachment *>> _insertedAttachments;
+}
+
+- (instancetype)init
+{
+    if (!(self = [super init]))
+        return nil;
+    _insertedAttachments = adoptNS([[NSMutableArray alloc] init]);
+    return self;
+}
+
+- (void)_webView:(WKWebView *)webView didInsertAttachment:(_WKAttachment *)attachment withSource:(NSString *)source
+{
+    [_insertedAttachments addObject:attachment];
+}
+
+- (NSArray<_WKAttachment *> *)insertedAttachments
+{
+    return _insertedAttachments.get();
+}
+
+@end
+#endif // ENABLE(ATTACHMENT_ELEMENT)
+
+#if ENABLE(APP_HIGHLIGHTS)
+@interface SiteIsolationAppHighlightDelegate : NSObject <_WKAppHighlightDelegate>
+- (NSArray<_WKAppHighlight *> *)storedHighlights;
+@end
+
+@implementation SiteIsolationAppHighlightDelegate {
+    RetainPtr<NSMutableArray<_WKAppHighlight *>> _storedHighlights;
+}
+
+- (instancetype)init
+{
+    if (!(self = [super init]))
+        return nil;
+    _storedHighlights = adoptNS([[NSMutableArray alloc] init]);
+    return self;
+}
+
+- (void)_webView:(WKWebView *)webView storeAppHighlight:(_WKAppHighlight *)highlight inNewGroup:(BOOL)inNewGroup requestOriginatedInApp:(BOOL)requestOriginatedInApp
+{
+    [_storedHighlights addObject:highlight];
+}
+
+- (NSArray<_WKAppHighlight *> *)storedHighlights
+{
+    return _storedHighlights.get();
+}
+
+@end
+#endif // ENABLE(APP_HIGHLIGHTS)
 
 namespace TestWebKitAPI {
 
@@ -12934,5 +13026,443 @@ TEST(SiteIsolation, ThirdPartyCookieBlockingSpoofedWebPageProxyID)
     Util::run(&completed);
     EXPECT_EQ([cookieCount unsignedIntegerValue], 0u);
 }
+
+// Editing, font, and spelling commands act on the focused frame's selection, so they must be sent to
+// the process containing the focused frame. These tests put the selection in a cross-origin iframe and
+// check that each command takes effect there (or that its reply describes the iframe). If the command is
+// sent to the main frame's process instead, it finds the main frame's empty selection and does nothing.
+
+TEST(SiteIsolation, ListCommandsInCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameTextWithCrossOriginIframe } },
+        { "/iframe"_s, { "<body contenteditable><ul><li>One</li><li id='item'>Two</li></ul></body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate, childFrame] = webViewWithFocusedCrossOriginIframe(server);
+    setSelectionInFrame(webView.get(), childFrame.get(), @"getSelection().setPosition(item.firstChild, 1)", _WKSelectionAttributeIsCaret);
+
+    auto listDepth = [&] {
+        return [[webView objectByEvaluatingJavaScript:@"(() => { let depth = 0; for (let element = item.parentElement; element; element = element.parentElement) { if (element.matches('ol, ul')) ++depth; } return depth; })()" inFrame:childFrame.get()] intValue];
+    };
+    EXPECT_EQ(1, listDepth());
+
+    [webView _increaseListLevel:nil];
+    EXPECT_TRUE(Util::waitFor([&] {
+        return listDepth() == 2;
+    }));
+
+    [webView _decreaseListLevel:nil];
+    EXPECT_TRUE(Util::waitFor([&] {
+        return listDepth() == 1;
+    }));
+
+    [webView _changeListType:nil];
+    EXPECT_TRUE(Util::waitFor([&] {
+        return [[webView stringByEvaluatingJavaScript:@"item.closest('ol, ul').tagName" inFrame:childFrame.get()] isEqualToString:@"OL"];
+    }));
+}
+
+// Page-wide state set on the web view after load must reach every web content process, not just the
+// main frame's. A cross-origin iframe's process that already exists never hears about the change, even
+// though a process created later would get it from the page's creation parameters.
+
+TEST(SiteIsolation, SetEditableAfterCrossOriginIframeLoads)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameTextWithCrossOriginIframe } },
+        { "/iframe"_s, { "<body>subframe text</body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate] = siteIsolatedViewAndDelegate(server, CGRectMake(0, 0, 800, 600));
+    [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:@"https://example.com/mainframe"]]];
+    [navigationDelegate waitForDidFinishNavigation];
+
+    RetainPtr childFrame = [webView firstChildFrame];
+    auto mainFrameIsEditable = [&] {
+        return [[webView objectByEvaluatingJavaScript:@"document.body.isContentEditable"] boolValue];
+    };
+    auto childFrameIsEditable = [&] {
+        return [[webView objectByEvaluatingJavaScript:@"document.body.isContentEditable" inFrame:childFrame.get()] boolValue];
+    };
+    EXPECT_FALSE(mainFrameIsEditable());
+    EXPECT_FALSE(childFrameIsEditable());
+
+    [webView _setEditable:YES];
+    EXPECT_TRUE(Util::waitFor([&] {
+        return mainFrameIsEditable();
+    }));
+    EXPECT_TRUE(Util::waitFor([&] {
+        return childFrameIsEditable();
+    }));
+
+    [webView _setEditable:NO];
+    EXPECT_TRUE(Util::waitFor([&] {
+        return !mainFrameIsEditable() && !childFrameIsEditable();
+    }));
+}
+
+TEST(SiteIsolation, SetMediaTypeAfterCrossOriginIframeLoads)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameTextWithCrossOriginIframe } },
+        { "/iframe"_s, { "<body>subframe text</body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate] = siteIsolatedViewAndDelegate(server, CGRectMake(0, 0, 800, 600));
+    [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:@"https://example.com/mainframe"]]];
+    [navigationDelegate waitForDidFinishNavigation];
+
+    RetainPtr childFrame = [webView firstChildFrame];
+    auto mainFrameMatchesPrint = [&] {
+        return [[webView objectByEvaluatingJavaScript:@"matchMedia('print').matches"] boolValue];
+    };
+    auto childFrameMatchesPrint = [&] {
+        return [[webView objectByEvaluatingJavaScript:@"matchMedia('print').matches" inFrame:childFrame.get()] boolValue];
+    };
+    EXPECT_FALSE(mainFrameMatchesPrint());
+    EXPECT_FALSE(childFrameMatchesPrint());
+
+    webView.get().mediaType = @"print";
+    EXPECT_TRUE(Util::waitFor([&] {
+        return mainFrameMatchesPrint();
+    }));
+    EXPECT_TRUE(Util::waitFor([&] {
+        return childFrameMatchesPrint();
+    }));
+
+    webView.get().mediaType = nil;
+    EXPECT_TRUE(Util::waitFor([&] {
+        return !mainFrameMatchesPrint() && !childFrameMatchesPrint();
+    }));
+}
+
+TEST(SiteIsolation, SetResourceLoadDelegateAfterCrossOriginIframeLoads)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameTextWithCrossOriginIframe } },
+        { "/iframe"_s, { "<body>subframe text</body>"_s } },
+        { "/subresource"_s, { "subresource"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate] = siteIsolatedViewAndDelegate(server, CGRectMake(0, 0, 800, 600));
+    [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:@"https://example.com/mainframe"]]];
+    [navigationDelegate waitForDidFinishNavigation];
+
+    RetainPtr childFrame = [webView firstChildFrame];
+
+    // The subresource load below happens after the cross-origin iframe's process already exists, so the
+    // delegate reaches it only if setResourceLoadClient() is sent to every content process, not just the
+    // main frame's.
+    RetainPtr resourceLoadDelegate = adoptNS([TestResourceLoadDelegate new]);
+    __block bool sawSubresourceRequest = false;
+    [resourceLoadDelegate setDidSendRequest:^(WKWebView *, _WKResourceLoadInfo *, NSURLRequest *request) {
+        if ([request.URL.path isEqualToString:@"/subresource"])
+            sawSubresourceRequest = true;
+    }];
+    webView.get()._resourceLoadDelegate = resourceLoadDelegate.get();
+
+    [webView objectByEvaluatingJavaScript:@"fetch('/subresource'); true" inFrame:childFrame.get()];
+    EXPECT_TRUE(Util::runFor(&sawSubresourceRequest, 5_s));
+
+    webView.get()._resourceLoadDelegate = nil;
+}
+
+#if ENABLE(ACCESSIBILITY_ANIMATION_CONTROL)
+
+TEST(SiteIsolation, PauseAllAnimationsAfterCrossOriginIframeLoads)
+{
+    RetainPtr<NSData> videoData = [NSData dataWithContentsOfFile:[NSBundle.test_resourcesBundle pathForResource:@"test-mse" ofType:@"mp4"] options:0 error:NULL];
+    HTTPResponse videoResponse { videoData.get() };
+    videoResponse.setHeaderField("Content-Type"_s, "video/mp4"_s);
+
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameTextWithCrossOriginIframe } },
+        { "/iframe"_s, { "<body><img id='img' src='/test-mse.mp4'></body>"_s } },
+        { "/test-mse.mp4"_s, videoResponse }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    // Use the internals-enabled plug-in to observe image animation state inside the cross-origin iframe, and
+    // point the data store at the test HTTPS proxy, since _test_configurationWithTestPlugInClassName: doesn't set one up.
+    RetainPtr configuration = [WKWebViewConfiguration _test_configurationWithTestPlugInClassName:@"WebProcessPlugInWithInternals" configureJSCForTesting:YES];
+    RetainPtr storeConfiguration = adoptNS([[_WKWebsiteDataStoreConfiguration alloc] initNonPersistentConfiguration]);
+    [storeConfiguration setHTTPSProxy:[NSURL URLWithString:[NSString stringWithFormat:@"https://127.0.0.1:%d/", server.port()]]];
+    [configuration setWebsiteDataStore:adoptNS([[WKWebsiteDataStore alloc] _initWithConfiguration:storeConfiguration.get()]).get()];
+
+    auto [webView, navigationDelegate] = siteIsolatedViewAndDelegate(configuration, CGRectMake(0, 0, 800, 600));
+    [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:@"https://example.com/mainframe"]]];
+    [navigationDelegate waitForDidFinishNavigation];
+
+    RetainPtr childFrame = [webView firstChildFrame];
+    auto childFrameImageIsAnimating = [&] {
+        return [[webView objectByEvaluatingJavaScript:@"window.internals.isImageAnimating(document.getElementById('img'))" inFrame:childFrame.get()] boolValue];
+    };
+    EXPECT_TRUE(Util::waitFor([&] {
+        return childFrameImageIsAnimating();
+    }));
+
+    // Pausing only takes effect when the system allows animation controls, so turn that on in the iframe's process.
+    [webView objectByEvaluatingJavaScript:@"window.internals.setImageAnimationEnabled(false); true" inFrame:childFrame.get()];
+    EXPECT_TRUE(Util::waitFor([&] {
+        return !childFrameImageIsAnimating();
+    }));
+
+    __block bool done = false;
+    [webView _playAllAnimationsWithCompletionHandler:^{
+        done = true;
+    }];
+    EXPECT_TRUE(Util::runFor(&done, 5_s));
+    EXPECT_TRUE(Util::waitFor([&] {
+        return childFrameImageIsAnimating();
+    }));
+
+    done = false;
+    [webView _pauseAllAnimationsWithCompletionHandler:^{
+        done = true;
+    }];
+    EXPECT_TRUE(Util::runFor(&done, 5_s));
+    EXPECT_TRUE(Util::waitFor([&] {
+        return !childFrameImageIsAnimating();
+    }));
+}
+
+#endif // ENABLE(ACCESSIBILITY_ANIMATION_CONTROL)
+
+TEST(SiteIsolation, FontAttributesDelegateSetAfterFocusingCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameTextWithCrossOriginIframe } },
+        { "/iframe"_s, { "<body contenteditable style='font-size: 37px'>subframe text</body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate, childFrame] = webViewWithFocusedCrossOriginIframe(server);
+    setSelectionInFrame(webView.get(), childFrame.get(), @"getSelection().setPosition(document.body.firstChild, 3)", _WKSelectionAttributeIsCaret);
+
+    // Let any editor state updates for the new selection arrive before the delegate is set, so that the
+    // only thing that can report font attributes is the web process learning that they are now needed.
+    [webView waitForNextPresentationUpdate];
+
+    // Setting a delegate that wants font attributes tells the web processes to start computing them and
+    // to send a fresh editor state. Only the focused iframe's process can report its font.
+    RetainPtr listener = adoptNS([SiteIsolationFontAttributesListener new]);
+    [webView setUIDelegate:listener.get()];
+    EXPECT_TRUE(Util::waitFor([&] {
+#if PLATFORM(MAC)
+        NSFont *font = [listener lastFontAttributes][NSFontAttributeName];
+#else
+        UIFont *font = [listener lastFontAttributes][NSFontAttributeName];
+#endif
+        return font.pointSize == 37;
+    }));
+}
+
+// Pasteboard, Services, and content insertion act on the focused frame's selection, so they must be sent to
+// the process containing the focused frame, and any pasteboard access must be granted to that process.
+
+#if ENABLE(MULTI_REPRESENTATION_HEIC)
+
+TEST(SiteIsolation, InsertAdaptiveImageGlyphInCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameTextWithCrossOriginIframe } },
+        { "/iframe"_s, { "<body contenteditable>subframe text</body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate, childFrame] = webViewWithFocusedCrossOriginIframe(server);
+    setSelectionInFrame(webView.get(), childFrame.get(), @"getSelection().setPosition(document.body.firstChild, 8)", _WKSelectionAttributeIsCaret);
+
+    RetainPtr data = [NSData dataWithContentsOfURL:[NSBundle.test_resourcesBundle URLForResource:@"adaptive-image-glyph" withExtension:@"heic"]];
+    RetainPtr adaptiveImageGlyph = adoptNS([[NSAdaptiveImageGlyph alloc] initWithImageContent:data.get()]);
+#if PLATFORM(MAC)
+    [(id<NSTextInputClient>)webView.get() insertAdaptiveImageGlyph:adaptiveImageGlyph.get() replacementRange:NSMakeRange(0, 0)];
+#else
+    RetainPtr range = adoptNS([[UITextRange alloc] init]);
+    [[webView textInputContentView] insertAdaptiveImageGlyph:adaptiveImageGlyph.get() replacementRange:range.get()];
+#endif
+
+    EXPECT_TRUE(Util::waitFor([&] {
+        return [[webView objectByEvaluatingJavaScript:@"!!document.querySelector('picture')" inFrame:childFrame.get()] boolValue];
+    }));
+}
+
+#endif // ENABLE(MULTI_REPRESENTATION_HEIC)
+
+// Dictation acts on the focused frame's selection, so it must be sent to the process containing the focused frame.
+// A text placeholder must be removed by the process whose document contains it, even if focus has moved since.
+
+TEST(SiteIsolation, TextPlaceholderInCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { "<body style='margin: 0'><input id='input'><iframe id='iframe' style='width: 400px; height: 300px; border: none;' src='https://webkit.org/iframe'></iframe></body>"_s } },
+        { "/iframe"_s, { "<body contenteditable>subframe text</body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate, childFrame] = webViewWithFocusedCrossOriginIframe(server);
+    setSelectionInFrame(webView.get(), childFrame.get(), @"getSelection().setPosition(document.body.firstChild, 8)", _WKSelectionAttributeIsCaret);
+
+#if PLATFORM(MAC)
+    using TextPlaceholder = NSTextPlaceholder;
+    id<NSTextInputClient_Async> textInput = (id<NSTextInputClient_Async>)webView.get();
+#else
+    using TextPlaceholder = UITextPlaceholder;
+    auto textInput = [webView textInputContentView];
+#endif
+
+    __block RetainPtr<TextPlaceholder> placeholder;
+    __block bool done = false;
+    [textInput insertTextPlaceholderWithSize:CGSizeMake(50, 100) completionHandler:^(TextPlaceholder *insertedPlaceholder) {
+        placeholder = insertedPlaceholder;
+        done = true;
+    }];
+    Util::run(&done);
+    ASSERT_NOT_NULL(placeholder.get());
+    EXPECT_TRUE([[webView objectByEvaluatingJavaScript:@"!!document.querySelector('div')" inFrame:childFrame.get()] boolValue]);
+
+    [webView objectByEvaluatingJavaScript:@"input.focus()"];
+    EXPECT_TRUE(Util::waitFor([&] {
+        return ![[webView firstChildFrame] _isFocused];
+    }));
+
+    done = false;
+    [textInput removeTextPlaceholder:placeholder.get() willInsertText:NO completionHandler:^{
+        done = true;
+    }];
+    Util::run(&done);
+    EXPECT_FALSE([[webView objectByEvaluatingJavaScript:@"!!document.querySelector('div')" inFrame:childFrame.get()] boolValue]);
+}
+
+#if ENABLE(ATTACHMENT_ELEMENT)
+
+// Inserting an attachment acts on the focused frame's selection, so it must go to the focused frame's process.
+// Updates and icons for an existing attachment must go to the process whose document contains it, and that
+// process must be able to find the element even when it isn't in the main frame's document.
+
+static RetainPtr<WKWebViewConfiguration> attachmentEnabledConfiguration(const HTTPServer& server)
+{
+    RetainPtr configuration = server.httpsProxyConfiguration();
+    [configuration _setAttachmentElementEnabled:YES];
+    return configuration;
+}
+
+static RetainPtr<NSFileWrapper> textFileWrapper(NSString *filename)
+{
+    RetainPtr fileWrapper = adoptNS([[NSFileWrapper alloc] initRegularFileWithContents:[@"Hello world" dataUsingEncoding:NSUTF8StringEncoding]]);
+    [fileWrapper setPreferredFilename:filename];
+    return fileWrapper;
+}
+
+static NSString * const attachmentTitleScript = @"document.querySelector('attachment')?.getAttribute('title') ?? ''";
+
+TEST(SiteIsolation, InsertAttachmentInCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameTextWithCrossOriginIframe } },
+        { "/iframe"_s, { "<body contenteditable></body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    RetainPtr configuration = attachmentEnabledConfiguration(server);
+    auto [webView, navigationDelegate, childFrame] = webViewWithFocusedCrossOriginIframe(server, configuration.get());
+    setSelectionInFrame(webView.get(), childFrame.get(), @"getSelection().setPosition(document.body, 0)", _WKSelectionAttributeIsCaret);
+
+    // The completion handler runs whether or not anything was inserted, so check the iframe's document.
+    __block bool done = false;
+    [webView _insertAttachmentWithFileWrapper:textFileWrapper(@"hello.txt").get() contentType:@"text/plain" completion:^(BOOL) {
+        done = true;
+    }];
+    Util::run(&done);
+
+    EXPECT_TRUE(Util::waitFor([&] {
+        return [[webView stringByEvaluatingJavaScript:attachmentTitleScript inFrame:childFrame.get()] isEqualToString:@"hello.txt"];
+    }));
+}
+
+TEST(SiteIsolation, SetFileWrapperForAttachmentInCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameTextWithCrossOriginIframe } },
+        { "/iframe"_s, { "<body><attachment title='original.txt' type='text/plain'></attachment></body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate] = siteIsolatedViewAndDelegate(attachmentEnabledConfiguration(server), CGRectMake(0, 0, 800, 600));
+    RetainPtr observer = adoptNS([SiteIsolationAttachmentObserver new]);
+    [webView setUIDelegate:observer.get()];
+    [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:@"https://example.com/mainframe"]]];
+    [navigationDelegate waitForDidFinishNavigation];
+
+    // The iframe's process reports the attachment when its element is connected.
+    EXPECT_TRUE(Util::waitFor([&] {
+        return [observer insertedAttachments].count == 1;
+    }));
+    RetainPtr<_WKAttachment> attachment = [observer insertedAttachments].firstObject;
+
+    __block bool done = false;
+    [attachment setFileWrapper:textFileWrapper(@"updated.txt").get() contentType:@"text/plain" completion:^(NSError *) {
+        done = true;
+    }];
+    Util::run(&done);
+
+    RetainPtr childFrame = [webView firstChildFrame];
+    EXPECT_TRUE(Util::waitFor([&] {
+        return [[webView stringByEvaluatingJavaScript:attachmentTitleScript inFrame:childFrame.get()] isEqualToString:@"updated.txt"];
+    }));
+}
+
+#endif // ENABLE(ATTACHMENT_ELEMENT)
+
+#if ENABLE(APP_HIGHLIGHTS)
+
+// Creating an app highlight acts on the focused frame's selection, so it must go to the focused frame's process.
+// The request must also complete even when there's nothing to highlight: under site isolation the UI process
+// crashes on a failed message check, and a request that's never answered is eventually cancelled with an empty
+// highlight, which fails the check.
+
+TEST(SiteIsolation, AddAppHighlightInCrossOriginIframe)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameTextWithCrossOriginIframe } },
+        { "/iframe"_s, { "<body>subframe text</body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate, childFrame] = webViewWithFocusedCrossOriginIframe(server);
+    RetainPtr delegate = adoptNS([SiteIsolationAppHighlightDelegate new]);
+    [webView _setAppHighlightDelegate:delegate.get()];
+    setSelectionInFrame(webView.get(), childFrame.get(), @"getSelection().selectAllChildren(document.body)", _WKSelectionAttributeIsRange);
+
+    [webView _addAppHighlight];
+    EXPECT_TRUE(Util::waitFor([&] {
+        return [delegate storedHighlights].count == 1;
+    }));
+    EXPECT_WK_STREQ("subframe text", [delegate storedHighlights].firstObject.text);
+}
+
+TEST(SiteIsolation, AddAppHighlightWithoutSelectionDoesNotCrashWhenWebProcessesExit)
+{
+    HTTPServer server({
+        { "/mainframe"_s, { mainFrameTextWithCrossOriginIframe } },
+        { "/iframe"_s, { "<body>subframe text</body>"_s } }
+    }, HTTPServer::Protocol::HttpsProxy);
+
+    auto [webView, navigationDelegate, childFrame] = webViewWithFocusedCrossOriginIframe(server);
+    RetainPtr delegate = adoptNS([SiteIsolationAppHighlightDelegate new]);
+    [webView _setAppHighlightDelegate:delegate.get()];
+
+    // Nothing is selected in either frame, so whichever process gets the request has nothing to highlight.
+    [webView _addAppHighlight];
+    [webView waitForNextPresentationUpdate];
+
+    // Any request that was never answered is cancelled when its process exits. That must not crash the UI process.
+    pid_t mainFramePID = [webView mainFrame].info._processIdentifier;
+    pid_t childFramePID = [webView firstChildFrame]._processIdentifier;
+    EXPECT_NE(mainFramePID, childFramePID);
+    kill(childFramePID, SIGKILL);
+    kill(mainFramePID, SIGKILL);
+    while (!kill(childFramePID, 0) || !kill(mainFramePID, 0))
+        Util::spinRunLoop();
+    Util::runFor(0.5_s);
+
+    EXPECT_EQ(0U, [delegate storedHighlights].count);
+}
+
+#endif // ENABLE(APP_HIGHLIGHTS)
 
 } // namespace TestWebKitAPI

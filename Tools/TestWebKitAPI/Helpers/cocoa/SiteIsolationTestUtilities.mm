@@ -33,6 +33,7 @@
 #import "Helpers/cocoa/TestNavigationDelegate.h"
 #import "Helpers/cocoa/TestUIDelegate.h"
 #import "Helpers/cocoa/TestWKWebView.h"
+#import "Helpers/cocoa/WKWebViewConfigurationExtras.h"
 #import <WebKit/WKFrameInfoPrivate.h>
 #import <WebKit/WKPreferencesPrivate.h>
 #import <WebKit/WKProcessPoolPrivate.h>
@@ -324,6 +325,26 @@ bool waitForTextContentInFrame(TestWKWebView *webView, WKFrameInfo *frame, NSStr
     return Util::waitFor([&] {
         return [[webView stringByEvaluatingJavaScript:[NSString stringWithFormat:@"%@.textContent", editableElement] inFrame:frame] isEqualToString:text];
     });
+}
+
+RetainPtr<WKWebViewConfiguration> configurationWithInternals(const HTTPServer& server)
+{
+    RetainPtr configuration = [WKWebViewConfiguration _test_configurationWithTestPlugInClassName:@"WebProcessPlugInWithInternals" configureJSCForTesting:YES];
+    [configuration setWebsiteDataStore:[server.httpsProxyConfiguration() websiteDataStore]];
+    return configuration;
+}
+
+CGPoint pointAtCharacterInIframe(TestWKWebView *webView, WKFrameInfo *childFrame, unsigned offset)
+{
+    RetainPtr script = [NSString stringWithFormat:@"(() => {"
+        "let range = document.createRange();"
+        "range.setStart(document.body.firstChild, %u);"
+        "range.setEnd(document.body.firstChild, %u);"
+        "let rect = range.getBoundingClientRect();"
+        "return [rect.left + 2, rect.top + rect.height / 2];"
+        "})()", offset, offset + 1];
+    RetainPtr result = [webView objectByEvaluatingJavaScript:script.get() inFrame:childFrame];
+    return CGPointMake(100 + [[result objectAtIndex:0] doubleValue], 100 + [[result objectAtIndex:1] doubleValue]);
 }
 
 } // namespace TestWebKitAPI

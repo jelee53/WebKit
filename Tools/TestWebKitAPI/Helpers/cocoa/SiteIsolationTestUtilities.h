@@ -103,6 +103,17 @@ void scrollFrameAndWait(TestWKWebView *, WKFrameInfo *, int scrollY);
 void insertTextInFrame(TestWKWebView *, WKFrameInfo *, NSString *editableElement, NSString *text);
 bool waitForTextContentInFrame(TestWKWebView *, WKFrameInfo *, NSString *editableElement, NSString *text);
 
+RetainPtr<WKWebViewConfiguration> configurationWithInternals(const HTTPServer&);
+
+// initial-scale=1 keeps CSS pixels equal to web-view coordinates, which the helper below relies on.
+static constexpr auto pointSelectionMainFrame = "<meta name='viewport' content='initial-scale=1'><body style='margin: 0'>main frame text<iframe id='iframe' style='position: absolute; left: 100px; top: 100px; width: 400px; height: 300px; border: none;' src='https://webkit.org/iframe'></iframe></body>"_s;
+static constexpr auto pointSelectionIframe = "<body contenteditable style='margin: 0; font: 20px monospace'>hello world</body>"_s;
+
+// A point in web-view coordinates just inside the left edge of the character at `offset` in the iframe's
+// first text node, so that the nearest character boundary is unambiguously `offset` itself. The iframe is
+// positioned at (100, 100) and nothing is scrolled, so its client coordinates are offset by exactly that.
+CGPoint pointAtCharacterInIframe(TestWKWebView *, WKFrameInfo *childFrame, unsigned offset);
+
 // Some main frame text and a 400x300 cross-origin iframe with id 'iframe', loaded from https://webkit.org/iframe.
 static constexpr auto mainFrameTextWithCrossOriginIframe = "<body style='margin: 0'>main frame text<iframe id='iframe' style='width: 400px; height: 300px; border: none;' src='https://webkit.org/iframe'></iframe></body>"_s;
 
