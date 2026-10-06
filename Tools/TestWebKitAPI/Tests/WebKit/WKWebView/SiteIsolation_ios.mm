@@ -303,7 +303,7 @@ TEST(SiteIsolation, InsertDictatedTextWithAlternativesInCrossOriginIframe)
     // Allow an input session to begin when the subframe's editable element is focused.
     bool didStartInputSession = false;
     RetainPtr inputDelegate = adoptNS([[TestInputDelegate alloc] init]);
-    [inputDelegate setFocusStartsInputSessionPolicyHandler:[&] (WKWebView *, id<_WKFocusedElementInfo>) {
+    [inputDelegate setFocusStartsInputSessionPolicyHandler:[&](WKWebView *, id<_WKFocusedElementInfo>) {
         didStartInputSession = true;
         return _WKFocusStartsInputSessionPolicyAllow;
     }];
@@ -363,7 +363,7 @@ TEST(SiteIsolation, ReplaceDictatedTextInCrossOriginIframe)
 
     bool didStartInputSession = false;
     RetainPtr inputDelegate = adoptNS([[TestInputDelegate alloc] init]);
-    [inputDelegate setFocusStartsInputSessionPolicyHandler:[&] (WKWebView *, id<_WKFocusedElementInfo>) {
+    [inputDelegate setFocusStartsInputSessionPolicyHandler:[&](WKWebView *, id<_WKFocusedElementInfo>) {
         didStartInputSession = true;
         return _WKFocusStartsInputSessionPolicyAllow;
     }];
@@ -743,7 +743,7 @@ TEST(SiteIsolation, SelectionInCrossOriginIframeTracksMainFrameScroll)
     while (!childInfoForHost(@"example.com") || !childInfoForHost(@"webkit.org"))
         Util::spinRunLoop();
 
-    auto readSelectionRect = [&]() -> CGRect {
+    auto readSelectionRect = [&] -> CGRect {
         __block CGRect rect = CGRectZero;
         __block bool didReceiveRect = false;
         [webView _selectionBoundingRectInMainFrameCoordinatesForTesting:^(CGRect receivedRect) {
@@ -1118,7 +1118,7 @@ TEST(SiteIsolation, RefocusingCrossOriginIframeFieldStartsInputSessionAgain)
     RetainPtr inputSessionElements = adoptNS([NSMutableArray new]);
 
     RetainPtr inputDelegate = adoptNS([[TestInputDelegate alloc] init]);
-    [inputDelegate setFocusStartsInputSessionPolicyHandler:[&] (WKWebView *, id<_WKFocusedElementInfo> info) {
+    [inputDelegate setFocusStartsInputSessionPolicyHandler:[&](WKWebView *, id<_WKFocusedElementInfo> info) {
         [focusedElements addObject:info.placeholder];
         // Disallowing an input session for the main frame's field is essential to reproducing the bug:
         // -_elementDidFocus bails before storing the new focused element information, so the UI process
@@ -1127,7 +1127,7 @@ TEST(SiteIsolation, RefocusingCrossOriginIframeFieldStartsInputSessionAgain)
         // overwrite that information, and the refocus would start a new session even without the fix.
         return [info.placeholder isEqualToString:@"main"] ? _WKFocusStartsInputSessionPolicyDisallow : _WKFocusStartsInputSessionPolicyAllow;
     }];
-    [inputDelegate setWillStartInputSessionHandler:[&] (WKWebView *, id<_WKFormInputSession>) {
+    [inputDelegate setWillStartInputSessionHandler:[&](WKWebView *, id<_WKFormInputSession>) {
         [inputSessionElements addObject:[focusedElements lastObject]];
     }];
     [webView _setInputDelegate:inputDelegate.get()];
@@ -1179,7 +1179,7 @@ static void testZoomToRevealFocusedElementRect(unsigned mainFrameScrollY, unsign
     // Allow an input session to begin when the input inside the subframe is focused.
     bool didStartInputSession = false;
     RetainPtr inputDelegate = adoptNS([[TestInputDelegate alloc] init]);
-    [inputDelegate setFocusStartsInputSessionPolicyHandler:[&] (WKWebView *, id<_WKFocusedElementInfo>) {
+    [inputDelegate setFocusStartsInputSessionPolicyHandler:[&](WKWebView *, id<_WKFocusedElementInfo>) {
         didStartInputSession = true;
         return _WKFocusStartsInputSessionPolicyAllow;
     }];

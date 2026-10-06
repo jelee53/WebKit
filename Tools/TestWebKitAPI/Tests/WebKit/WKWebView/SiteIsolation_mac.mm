@@ -932,7 +932,7 @@ static void checkValidationMessageAnchorInCrossOriginIframe(const String& mainfr
     [navigationDelegate allowAnyTLSCertificate];
     webView.get().navigationDelegate = navigationDelegate.get();
 
-    auto validationBubbleAnchorRect = [webView]() -> NSRect {
+    auto validationBubbleAnchorRect = [webView] -> NSRect {
         NSDictionary *contents = [webView _contentsOfUserInterfaceItem:@"validationBubble"][@"validationBubble"];
         NSDictionary *anchorRect = contents[@"anchorRect"];
         if (!anchorRect)

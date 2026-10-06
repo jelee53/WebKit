@@ -104,11 +104,14 @@
 #if ENABLE(IMAGE_ANALYSIS)
 #import "Helpers/cocoa/ImageAnalysisTestingUtilities.h"
 #import <pal/spi/cocoa/VisionKitCoreSPI.h>
-#import <pal/cocoa/VisionKitCoreSoftLink.h>
 #endif
 
 #if ENABLE(MULTI_REPRESENTATION_HEIC)
 #import <UIFoundation/NSAdaptiveImageGlyph.h>
+#endif
+
+#if ENABLE(IMAGE_ANALYSIS)
+#import <pal/cocoa/VisionKitCoreSoftLink.h>
 #endif
 
 @interface WKWebView ()
@@ -4099,7 +4102,7 @@ TEST(SiteIsolation, CancelProvisionalLoad)
         },
     });
 
-    auto checkStateAfterSequentialFrameLoads = [webView = RetainPtr { webView }, navigationDelegate = RetainPtr { navigationDelegate }] (NSString *first, NSString *second, Vector<ExpectedFrameTree>&& expectedTrees) {
+    auto checkStateAfterSequentialFrameLoads = [webView = RetainPtr { webView }, navigationDelegate = RetainPtr { navigationDelegate }](NSString *first, NSString *second, Vector<ExpectedFrameTree>&& expectedTrees) {
         [webView evaluateJavaScript:[NSString stringWithFormat:@"i = document.getElementById('testiframe'); i.addEventListener('load', () => { alert('iframe loaded') }); i.src = '%@'; setTimeout(()=>{ i.src = '%@' }, Math.random() * 100)", first, second] completionHandler:nil];
         EXPECT_WK_STREQ([webView _test_waitForAlert], "iframe loaded");
         checkFrameTreesInProcesses(webView.get(), WTF::move(expectedTrees));
@@ -5917,11 +5920,11 @@ TEST(SiteIsolation, SandboxFlags)
         receivedAlert = true;
         completionHandler();
     };
-    auto returnNilOpenedView = [&] (WKWebViewConfiguration *, WKNavigationAction *, WKWindowFeatures *) -> WKWebView * {
+    auto returnNilOpenedView = [&](WKWebViewConfiguration *, WKNavigationAction *, WKWindowFeatures *) -> WKWebView * {
         receivedOpen = true;
         return nil;
     };
-    auto returnNonNilOpenedView = [&] (WKWebViewConfiguration *configuration, WKNavigationAction *, WKWindowFeatures *) -> WKWebView * {
+    auto returnNonNilOpenedView = [&](WKWebViewConfiguration *configuration, WKNavigationAction *, WKWindowFeatures *) -> WKWebView * {
         EXPECT_FALSE(openedWebViewAndDelegates.webView);
         openedWebViewAndDelegates = WebViewAndDelegates {
             adoptNS([[TestWKWebView alloc] initWithFrame:CGRectZero configuration:configuration]),
@@ -6181,7 +6184,7 @@ TEST(SiteIsolation, IntentionalAboutBlankIframeBackForwardNotSkipped)
     [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:@"https://example.com/example"]]];
     EXPECT_WK_STREQ([webView _test_waitForAlert], "a");
 
-    auto childURLIs = [webView = RetainPtr { webView }] (NSString *expected) {
+    auto childURLIs = [webView = RetainPtr { webView }](NSString *expected) {
         for (int i = 0; i < 100; ++i) {
             RetainPtr value = [webView objectByEvaluatingJavaScript:@"location.href" inFrame:[webView firstChildFrame]];
             if ([value isKindOfClass:[NSString class]] && [(NSString *)value.get() isEqualToString:expected])
@@ -6311,7 +6314,7 @@ TEST(SiteIsolation, IframeOpener)
     }, HTTPServer::Protocol::HttpsProxy);
 
     auto [webView, navigationDelegate] = siteIsolatedViewAndDelegate(server);
-    auto verifyThatOpenerIsParent = [webView = RetainPtr { webView }] (bool openerShouldBeParent) {
+    auto verifyThatOpenerIsParent = [webView = RetainPtr { webView }](bool openerShouldBeParent) {
         auto value = openerShouldBeParent ? "1" : "0";
         EXPECT_WK_STREQ([webView stringByEvaluatingJavaScript:@"window.frames[0].opener == self"], value);
         EXPECT_WK_STREQ([webView stringByEvaluatingJavaScript:@"window.opener == window.parent" inFrame:[webView firstChildFrame]], value);
@@ -6745,7 +6748,7 @@ static void callMethodOnFirstVideoElementInFrame(WKWebView *webView, NSString *m
 
 static void expectPlayingAudio(WKWebView *webView, bool expected, ASCIILiteral reason)
 {
-    bool success = TestWebKitAPI::Util::waitFor([webView, expected]() {
+    bool success = TestWebKitAPI::Util::waitFor([webView, expected] {
         return [webView _isPlayingAudio] == expected;
     });
     EXPECT_TRUE(success) << reason.characters();
@@ -6861,7 +6864,7 @@ TEST(SiteIsolation, MutesAndSetsAudioInMultipleFrames)
     expectPlayingAudio(webView.get(), true, "Should be playing audio in remote frame"_s);
 
     auto expectMuted = [&](bool expectedMuted, WKFrameInfo *frame, ASCIILiteral reason) {
-        bool success = TestWebKitAPI::Util::waitFor([&]() {
+        bool success = TestWebKitAPI::Util::waitFor([&] {
             id actuallyMuted = [webView objectByEvaluatingJavaScript:@"window.internals.isEffectivelyMuted(document.getElementsByTagName('video')[0])" inFrame:frame];
             return [actuallyMuted boolValue] == expectedMuted;
         });
@@ -6869,7 +6872,7 @@ TEST(SiteIsolation, MutesAndSetsAudioInMultipleFrames)
     };
 
     auto expectMediaVolume = [&](float expectedMediaVolume, WKFrameInfo *frame, ASCIILiteral reason) {
-        bool success = TestWebKitAPI::Util::waitFor([&]() {
+        bool success = TestWebKitAPI::Util::waitFor([&] {
             id actualMediaVolume = [webView objectByEvaluatingJavaScript:@"window.internals.pageMediaVolume()" inFrame:frame];
             return [actualMediaVolume floatValue] == expectedMediaVolume;
         });
@@ -6985,7 +6988,7 @@ TEST(SiteIsolation, StopsMediaCaptureInRemoteFrame)
 
     auto assertCaptureState = [&](_WKMediaCaptureStateDeprecated expected) {
         _WKMediaCaptureStateDeprecated actual;
-        TestWebKitAPI::Util::waitFor([webView, expected, &actual]() {
+        TestWebKitAPI::Util::waitFor([webView, expected, &actual] {
             actual = [webView _mediaCaptureState];
             return actual == expected;
         });
@@ -7200,7 +7203,7 @@ TEST(SiteIsolation, CoordinateTransformation)
 
     auto [webView, navigationDelegate] = siteIsolatedViewAndDelegate(server);
 
-    auto convertRect = [] (TestWKWebView *webView, CGRect rect) {
+    auto convertRect = [](TestWKWebView *webView, CGRect rect) {
         __block CGRect result;
         __block bool done { false };
         [webView _convertRect:rect fromFrame:[webView firstChildFrame] toMainFrameCoordinates:^(CGRect transformedRect, NSError *error) {
@@ -7303,13 +7306,13 @@ TEST(SiteIsolation, CompleteTextManipulation)
     bool didReceiveMainFrameContent = false;
     bool didReceiveIframeContent = false;
     auto webViewAndDelegates = makeWebViewAndDelegates(server);
-    [webViewAndDelegates.messageHandler addMessage:@"loaded" withHandler:[&]() {
+    [webViewAndDelegates.messageHandler addMessage:@"loaded" withHandler:[&] {
         didLoad = true;
     }];
-    [webViewAndDelegates.messageHandler addMessage:@"MAINFRAME CONTENT" withHandler:[&]() {
+    [webViewAndDelegates.messageHandler addMessage:@"MAINFRAME CONTENT" withHandler:[&] {
         didReceiveMainFrameContent = true;
     }];
-    [webViewAndDelegates.messageHandler addMessage:@"IFRAME CONTENT" withHandler:[&]() {
+    [webViewAndDelegates.messageHandler addMessage:@"IFRAME CONTENT" withHandler:[&] {
         didReceiveIframeContent = true;
     }];
     RetainPtr webView = webViewAndDelegates.webView;
@@ -7394,7 +7397,7 @@ TEST(SiteIsolation, CompleteTextManipulationFailsInSomeFrame)
 
     bool receivedMessage = false;
     auto webViewAndDelegates = makeWebViewAndDelegates(server);
-    [webViewAndDelegates.messageHandler addMessage:@"loaded" withHandler:[&]() {
+    [webViewAndDelegates.messageHandler addMessage:@"loaded" withHandler:[&] {
         receivedMessage = true;
     }];
     RetainPtr webView = webViewAndDelegates.webView;
@@ -7733,7 +7736,7 @@ TEST(SiteIsolation, CreateWebArchiveForCopy)
     <!DOCTYPE html>
     subframecontent
     <script>
-        window.addEventListener('message', function(event) { 
+        window.addEventListener('message', function(event) {
             alert('hi');
         });
     </script>
@@ -7808,7 +7811,7 @@ TEST(SiteIsolation, CreateWebArchiveNestedFrameForCopy)
     subframecontent
     <iframe src='https://example.com/nestedframe'></iframe>
     <script>
-        window.addEventListener('message', function(event) { 
+        window.addEventListener('message', function(event) {
             alert('hi');
         });
     </script>
@@ -8152,7 +8155,7 @@ TEST(SiteIsolation, Events)
         @"pageshow",
     ];
     if (![exampleMessages isEqualToArray:expectedExampleMessages]) {
-        WTFLogAlways("Actual example messages: %@", exampleMessages.get());
+        NSLog(@"Actual example messages: %@", exampleMessages.get());
         EXPECT_TRUE(false);
     }
 
@@ -8166,7 +8169,7 @@ TEST(SiteIsolation, Events)
         @"pageswap",
     ];
     if (![webkitMessages isEqualToArray:expectedWebKitMessages]) {
-        WTFLogAlways("Actual webkit messages: %@", webkitMessages.get());
+        NSLog(@"Actual webkit messages: %@", webkitMessages.get());
         EXPECT_TRUE(false);
     }
 
@@ -8178,7 +8181,7 @@ TEST(SiteIsolation, Events)
 #endif
     ];
     if (![appleMessages isEqualToArray:expectedAppleMessages]) {
-        WTFLogAlways("Actual apple messages: %@", appleMessages.get());
+        NSLog(@"Actual apple messages: %@", appleMessages.get());
         EXPECT_TRUE(false);
     }
 }
@@ -8860,7 +8863,7 @@ TEST(SiteIsolation, SharedProcessWebProcessCacheCanEvict)
     EXPECT_NE(mainFrameProcessB, mainFrameProcess);
 
     // No processes should be in the cache due to eviction timeout of 0.
-    bool cacheIsEmpty = Util::waitFor([&]() {
+    bool cacheIsEmpty = Util::waitFor([&] {
         return ![processPool _processCacheSize];
     });
     EXPECT_TRUE(cacheIsEmpty);
@@ -9150,7 +9153,7 @@ TEST(SiteIsolation, HitTesting)
         { "/exampleframe"_s, { makeString("<div id=exampleiframediv>"_s, text, text, "</div>"_s) } },
     }, HTTPServer::Protocol::HttpsProxy);
 
-    auto hitTestResult = [] (RetainPtr<WKWebView> webView, CGPoint point, WKFrameInfo *coordinateFrame = nil) -> RetainPtr<_WKJSHandle> {
+    auto hitTestResult = [](RetainPtr<WKWebView> webView, CGPoint point, WKFrameInfo *coordinateFrame = nil) -> RetainPtr<_WKJSHandle> {
         __block bool done { false };
         __block RetainPtr<_WKJSHandle> result;
         [webView _hitTestAtPoint:point inFrameCoordinateSpace:coordinateFrame inContentWorld:WKContentWorld.pageWorld completionHandler:^(_WKJSHandle *node, NSError *error) {
@@ -9162,7 +9165,7 @@ TEST(SiteIsolation, HitTesting)
         return result;
     };
 
-    auto hitNodePrototypeAndParentElement = [&] (RetainPtr<TestWKWebView> webView, CGPoint point, WKFrameInfo *coordinateFrame = nil) -> NSString * {
+    auto hitNodePrototypeAndParentElement = [&](RetainPtr<TestWKWebView> webView, CGPoint point, WKFrameInfo *coordinateFrame = nil) -> NSString * {
         auto node = hitTestResult(webView, point, coordinateFrame);
         EXPECT_EQ([node world], WKContentWorld.pageWorld);
         if (!node)
@@ -9170,7 +9173,7 @@ TEST(SiteIsolation, HitTesting)
         return [webView objectByCallingAsyncFunction:@"return Object.getPrototypeOf(n).toString() + ' ' + n.id + ', child of ' + n.parentElement?.id" withArguments:@{ @"n" : node.get() } inFrame:node.get().frame inContentWorld:WKContentWorld.pageWorld];
     };
 
-    auto runTest = [&] (bool withSiteIsolation) {
+    auto runTest = [&](bool withSiteIsolation) {
         RetainPtr configuration = server.httpsProxyConfiguration();
         if (withSiteIsolation)
             enableSiteIsolation(configuration.get());
@@ -9187,7 +9190,7 @@ TEST(SiteIsolation, HitTesting)
         [webView loadRequest:[NSURLRequest requestWithURL:[NSURL URLWithString:@"https://example.com/example"]]];
         [webView _test_waitForDidFinishNavigationWhileIgnoringSSLErrors];
 
-        auto hitTestPointInMainFrame = [=] (size_t x, size_t y, const char* expected) {
+        auto hitTestPointInMainFrame = [=](size_t x, size_t y, const char* expected) {
             EXPECT_WK_STREQ(hitNodePrototypeAndParentElement(webView, CGPointMake(x, y)), expected);
         };
         hitTestPointInMainFrame(40, 40, "[object Text] undefined, child of webkitiframediv");
@@ -9197,7 +9200,7 @@ TEST(SiteIsolation, HitTesting)
         hitTestPointInMainFrame(340, 300, "[object Text] undefined, child of mainframediv");
 
         RetainPtr iframe = [webView firstChildFrame];
-        auto hitTestPointInIFrame = [=] (size_t x, size_t y, const char* expected) {
+        auto hitTestPointInIFrame = [=](size_t x, size_t y, const char* expected) {
             EXPECT_WK_STREQ(hitNodePrototypeAndParentElement(webView, CGPointMake(x, y), iframe.get()), expected);
         };
         hitTestPointInIFrame(10, 10, "[object Text] undefined, child of webkitiframediv");
@@ -9222,7 +9225,7 @@ TEST(SiteIsolation, HitTestingInContentWorld)
     RetainPtr<WKContentWorld> contentWorld = [WKContentWorld worldWithName:@"HitTestingContentWorld"];
     EXPECT_NE(contentWorld.get(), WKContentWorld.pageWorld);
 
-    auto hitTestResult = [&] (RetainPtr<WKWebView> webView, CGPoint point) -> RetainPtr<_WKJSHandle> {
+    auto hitTestResult = [&](RetainPtr<WKWebView> webView, CGPoint point) -> RetainPtr<_WKJSHandle> {
         __block bool done { false };
         __block RetainPtr<_WKJSHandle> result;
         [webView _hitTestAtPoint:point inFrameCoordinateSpace:nil inContentWorld:contentWorld.get() completionHandler:^(_WKJSHandle *node, NSError *error) {
@@ -9234,7 +9237,7 @@ TEST(SiteIsolation, HitTestingInContentWorld)
         return result;
     };
 
-    auto runTest = [&] (bool withSiteIsolation) {
+    auto runTest = [&](bool withSiteIsolation) {
         RetainPtr configuration = server.httpsProxyConfiguration();
         if (withSiteIsolation)
             enableSiteIsolation(configuration.get());
@@ -9264,7 +9267,7 @@ TEST(SiteIsolation, HitTestingInContentWorld)
 
 TEST(SiteIsolation, HitTestingInScrolledCrossOriginIframe)
 {
-    auto runTest = [] (int iframeTop) {
+    auto runTest = [](int iframeTop) {
         HTTPServer server({
             { "/example"_s, { makeString(
                 "<body style='margin: 0; height: 2000px'><iframe style='position: absolute; left: 10px; top: "_s, iframeTop,
